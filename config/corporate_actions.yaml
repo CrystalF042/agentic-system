@@ -1,0 +1,24 @@
+# 公司行为例外表（deterministic corporate-action exception）
+#
+# 为什么需要它：合并/分拆/更名后，数据商（yfinance 等）的价格序列往往【连续】，
+# 但【经济主体】已经断裂。直接拿断点前的历史算 12 个月动量、120 日趋势，
+# 数学上算得出来，经济含义却不连续 —— 会得到"看起来完全合法、实际已失真"的因子值。
+#
+# 免费数据无法自动识别这类事件：
+#   - 成分表的 Date added 会继承存续主体的原始入指日（VMRK 显示 2001-12-03，即 EQR 的日期）
+#   - CIK 同样继承（合并中存续的法律主体不变）
+# 因此：① 系统用【快照差分 + 身份登记簿】自动发现代码/名称变更（上线次日起生效）；
+#       ② 已知事件在此显式登记，可审计、可复核。
+#
+# 规则：identity_effective 之后不足 lookback_days（默认 365 天，对应 12 个月动量窗）的标的，
+#       其价量因子仍描述【前身主体】，故本轮不进入选股，并在数据漏斗里如实计数。
+#       只排除、不删数据；到期自动恢复。
+
+lookback_days: 365
+
+actions:
+  VMRK:
+    effective: "2026-08-18"
+    type: merger
+    note: "Equity Residential (EQR) 与 AvalonBay (AVB) 合并为 Vivmark Residential；EQR 为存续法律主体，故价格历史连续，但 AVB 股东占合并后多数，经济主体已变。"
+    predecessors: [EQR, AVB]

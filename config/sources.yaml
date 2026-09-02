@@ -1,0 +1,64 @@
+# CIO 数据源配置 —— 全免费、零 API Key、公开来源
+# bucket: world(国际综合，喂"国际十大要闻") / cn(中国，喂"中国财经/关注池")
+# 每源标 region 与 weight(源权威度基准分)。RSS 地址会变，run_premarket 逐条测连通性、失败降级到 Google News。
+
+rss:
+  # ================= world：国际综合大报（不限财经，喂国际十大要闻）=================
+  - {name: BBC World,        url: "https://feeds.bbci.co.uk/news/world/rss.xml",        bucket: world, region: international, weight: 3}
+  - {name: BBC Business,     url: "https://feeds.bbci.co.uk/news/business/rss.xml",     bucket: world, region: international, weight: 3}
+  - {name: Guardian World,   url: "https://www.theguardian.com/world/rss",              bucket: world, region: international, weight: 3}
+  - {name: Al Jazeera,       url: "https://www.aljazeera.com/xml/rss/all.xml",          bucket: world, region: international, weight: 3}
+  - {name: Deutsche Welle,   url: "https://rss.dw.com/rdf/rss-en-all",                  bucket: world, region: international, weight: 2}
+  - {name: France24,         url: "https://www.france24.com/en/rss",                    bucket: world, region: international, weight: 2}
+  - {name: NPR World,        url: "https://feeds.npr.org/1004/rss.xml",                 bucket: world, region: international, weight: 2}
+  - {name: NPR Top,          url: "https://feeds.npr.org/1001/rss.xml",                 bucket: world, region: international, weight: 2}
+  - {name: CNBC World,       url: "https://www.cnbc.com/id/100727362/device/rss/rss.html", bucket: world, region: international, weight: 3}
+  - {name: CNBC Markets,     url: "https://www.cnbc.com/id/20910258/device/rss/rss.html",  bucket: world, region: international, weight: 3}
+  - {name: MarketWatch,      url: "https://feeds.content.dowjones.io/public/rss/mw_topstories", bucket: world, region: international, weight: 2}
+  - {name: Yonhap (KR/EN),   url: "https://en.yna.co.kr/RSS/news.xml",                  bucket: world, region: international, weight: 2}
+  - {name: Kyodo (JP/EN),    url: "https://english.kyodonews.net/rss/news.xml",         bucket: world, region: international, weight: 2}
+
+  # ================= cn：中国（本土 + 海外看中国，喂中国财经/关注池）=================
+  - {name: SCMP China,       url: "https://www.scmp.com/rss/4/feed",                    bucket: cn, region: china, weight: 3}
+  - {name: SCMP Economy,     url: "https://www.scmp.com/rss/92/feed",                   bucket: cn, region: china, weight: 3}
+  - {name: Caixin Global,    url: "https://www.caixinglobal.com/rss/all.xml",           bucket: cn, region: china, weight: 3}
+  - {name: Sixth Tone,       url: "https://www.sixthtone.com/rss",                      bucket: cn, region: china, weight: 2}
+  - {name: 东方财富-要闻,     url: "http://rss.eastmoney.com/rss_partener.xml",          bucket: cn, region: china, weight: 2}
+  - {name: 新华网财经,        url: "http://www.xinhuanet.com/fortune/news_fortune.xml",  bucket: cn, region: china, weight: 2}
+
+# Google News RSS（免费、合法）。topic 段用官方"世界/财经"头条聚合（含路透/AP/纽约时报等付费墙外标题）。
+google_news:
+  template: "https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
+  # 官方分区头条（世界/财经）—— 国际十大要闻的主力聚合源
+  section_feeds:
+    - {name: "GNews World",    url: "https://news.google.com/rss/headlines/section/topic/WORLD?hl=en-US&gl=US&ceid=US:en",    bucket: world, region: international, weight: 3}
+    - {name: "GNews Business", url: "https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=en-US&gl=US&ceid=US:en", bucket: world, region: international, weight: 3}
+    - {name: "GNews Tech",     url: "https://news.google.com/rss/headlines/section/topic/TECHNOLOGY?hl=en-US&gl=US&ceid=US:en", bucket: world, region: international, weight: 2}
+  # 关键词补抓。bucket 决定它在哪个市场下才抓：cn 桶只在 CIO_MARKET=cn 下抓，
+  # us 桶只在 CIO_MARKET=us 下抓。改这里不用动代码。
+  standing_queries:
+    # ---- cn：A股模式 ----
+    - {q: "China economy",  bucket: cn, region: china}
+    - {q: "China stocks",   bucket: cn, region: china}
+    - {q: "PBOC OR \"People's Bank of China\"", bucket: cn, region: china}
+    # ---- us：美股模式。**这三条是新加的**，因为把 cn 桶关掉之后
+    #      standing_queries 会整段变空——一个静默失效的采集通道。
+    #      三条都是宏观驱动项（利率/通胀/联储），不想要就删掉这三行。
+    - {q: "Federal Reserve OR FOMC", bucket: us, region: us}
+    - {q: "US inflation OR CPI",     bucket: us, region: us}
+    - {q: "Treasury yields",         bucket: us, region: us}
+
+# Yahoo Finance 个股/ETF 新闻头条 RSS（关注池与专题用）
+yahoo_ticker_rss:
+  template: "https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}&region=US&lang=en-US"
+
+# EDGAR（美股专题公告）
+edgar:
+  submissions_api: "https://data.sec.gov/submissions/CIK{cik}.json"
+  recent_limit: 8
+
+limits:
+  per_feed_items: 25
+  fetch_fulltext_top: 40
+  http_timeout_seconds: 20
+  overall_fetch_timeout_seconds: 480

@@ -1,0 +1,22 @@
+focus:
+- topic: 美国
+  keywords:
+  - 美国
+  - 美联储
+  - Fed
+  - FOMC
+  - 美股
+  - 美国金融
+  - 利率
+  - 降息
+  - 加息
+  - 华尔街
+  - 美债
+  - 美元
+  - 银行股
+  - Wall Street
+  - Nasdaq
+  - 标普
+  - 道琼斯
+  weight: 8
+  until: '2026-08-14'

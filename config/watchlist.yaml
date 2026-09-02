@@ -1,0 +1,82 @@
+# CIO 关注池 + 趋势视角权重
+# 关注池优先级：关注池标的 > 关注池所在板块 > 宏观 > 其他
+# 趋势视角（早报与专题一致）：资金面 / 政策 / 预期修正 / 异动 —— 命中这些的事实优先上浮、独立成栏。
+
+watchlist:
+  银行:
+    desc: 六大国有银行（防御性压舱石）
+    names_cn: [工商银行, 农业银行, 中国银行, 建设银行, 交通银行, 邮储银行]
+    a_shares: ["601398", "601288", "601988", "601939", "601328", "601658"]
+    keywords: [不良贷款率, 股息率, 汇金, 国家队, 净息差, 拨备覆盖率, 存款准备金, LPR]
+    keywords_en: [ICBC, "Bank of China", "China Construction Bank", "state-owned banks", dividend yield, "non-performing loan"]
+
+  创新药:
+    desc: 医药进攻性矛头（创新药 Innovative Drugs）
+    names_cn: []          # 赛道为主，标的按新闻动态识别
+    a_shares: []
+    # 关键词收窄：删去过泛的"出海/授权/获批/BD"（会把综合类稿件误标成创新药），只留医药专有词
+    keywords: [创新药, 三期临床, 医保谈判, 集采, 创新药出海, 对外授权, license-out, NMPA, 获批上市, 管线, ADC, 双抗]
+    keywords_en: ["clinical trial", "phase 3", "innovative drug", "license-out", oncology]
+    weak: [FDA, approval, biotech, 临床]   # 泛词/单字：只可佐证，不可单独触发命中
+
+  硬科技:                # 原名"高科技ETF"——ETF 是产品类型不是板块，改为板块名"硬科技"
+    desc: 科技成长（半导体/AI/算力/光模块/机器人/先进制程/存储芯片），科技卫星配置
+    names_cn: []
+    a_shares: []
+    etfs: ["512760", "159995", "515790", "588000", "159819"]   # 半导体/芯片/光伏/科创50/AI ETF（内部观察位，不作板块名展示）
+    # 删去 纳指/纳斯达克/云/卫星 等泛词（避免把美股大盘复述误标成硬科技）；加存储芯片/光刻
+    keywords: [半导体, 人工智能, 算力, 光模块, 机器人, 先进制程, 存储芯片, 光刻, 出口管制, EDA]
+    keywords_en: [semiconductor, "artificial intelligence", "export control", robotics, "optical module"]
+    weak: [GPU, chip, 芯片]   # 泛词：只可佐证，不可单独触发命中
+
+# 美股观察位：不进常规盘前，只在 CEO 专题指令时触发（run_topic.py）
+us_watch_on_demand: true
+
+# 数据锚定：每日固定报的权威指数（yfinance），是行情数字的【唯一真源】。
+# 铁律：BLUF 与新闻摘要一律不得复述行情点位/涨跌幅——数字只出现在这里。
+data_anchor:
+  美股: {"道琼斯": "^DJI", "标普500": "^GSPC", "纳斯达克": "^IXIC", "费城半导体": "^SOX"}
+  港股: {"恒生指数": "^HSI", "恒生科技": "HSTECH.HK"}   # 恒生科技用 HSTECH.HK（^HSTECH 在 Yahoo 已失效/404）
+  日韩: {"日经225": "^N225", "韩国KOSPI": "^KS11"}
+  中国A股: {"上证综指": "000001.SS", "沪深300": "000300.SS"}
+  # 北向资金走 akshare（见 funds.py），单列在资金面
+
+# ---------------- 趋势视角关键词权重 ----------------
+# 命中任一关键词即打上对应 trend_tag，并加分上浮（分值越高越靠前、越可能独立成栏）。
+trend_lenses:
+  资金面:
+    score: 5
+    keywords: [北向资金, 主力资金, 资金净流入, 资金净流出, 融资余额, 融券, ETF 申购, ETF 赎回, 成交额, 换手率, 增持, 减持, 回购, 南向资金]
+    keywords_en: ["net inflow", "net outflow", "fund flow", "share buyback", "stake increase", "block trade", "ETF inflow", "northbound"]
+  政策:
+    score: 5
+    keywords: [央行, 证监会, 国常会, 降准, 降息, 加息, 监管, 新规, 政策, 财政, 国资委, 汇金, 医保, 关税, 出口管制, 制裁]
+    keywords_en: ["central bank", "Federal Reserve", "rate cut", "rate hike", regulation, tariff, sanction, "export control", policy, subsidy]
+  预期修正:
+    score: 4
+    keywords: [上调, 下调, 评级, 目标价, 盈利预警, 业绩预告, 超预期, 不及预期, 一致预期, 上修, 下修, 首次覆盖, 研报]
+    keywords_en: [upgrade, downgrade, "price target", "raised guidance", "cut guidance", "beats estimates", "misses estimates", "initiated coverage", "profit warning"]
+  异动:
+    score: 4
+    keywords: [涨停, 跌停, 异动, 大涨, 大跌, 停牌, 复牌, 闪崩, 拉升, 巨量, 盘中]
+    keywords_en: [surge, plunge, "halted", "circuit breaker", tumble, soar, spike, selloff]
+  公告:
+    score: 3
+    keywords: [公告, 财报, 季报, 年报, 中报, 业绩, 分红, 并购, 重组, 定增, 中标, 减持计划, 8-K, 10-Q, 10-K]
+    keywords_en: ["8-K", "10-Q", "10-K", earnings, filing, merger, acquisition, dividend, guidance]
+
+# 信号强度（相对排序，非绝对阈值）：
+#   强 = 全部条目中材料度最高的前若干条（且分数达 floor）；中 = 次级；弱 = 其余。
+#   目的：让"强"稀缺、有区分度，杜绝满屏皆"强"。
+signal_ranking:
+  strong_cap: 6          # "强"最多几条
+  strong_ratio: 0.12     # 或占比上限（取 min）
+  strong_floor: 9        # "强"的最低分门槛
+  medium_floor: 5        # >= 此分为"中"，否则"弱"
+
+# （利率/大宗/汇率锚已按 CEO 指示精简为纯股指体系，见上方 data_anchor；如需可扩展）
+
+# 噪音/标题党过滤：命中则大幅降权，且不得进入 BLUF 与"强"信号
+noise_keywords: [有戏, 火力全开, 惊现, 刷屏, 一览, 附名单, 大揭秘, 爆了, 稳了, 必看, 神预言,
+                 秒杀, 疯狂, 干货, 重磅来袭, 速看, 划重点, 炸裂, 沸腾]
+noise_penalty: 5         # 命中噪音词的扣分

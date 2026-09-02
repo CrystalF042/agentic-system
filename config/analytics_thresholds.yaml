@@ -1,0 +1,58 @@
+# 证券二部 — Systematic Analytics 阈值与窗口配置
+#
+# 这个文件的存在本身就是一条纪律：Exceptions 里的每一条红线都是【人选的】，
+# 不是模型算出来的。写进配置、并在报告里把阈值本身印出来，是为了让半年后读报告的人
+# 一眼分清"这是测量"和"这是我们定的判断标准"。
+#
+# 改这里会改变 Exceptions 的输出。改完请在 version 上留痕（报告会打印 version）。
+version: analytics-v1
+
+# ---------------- 估计窗口（交易日）----------------
+# 铁律：窗口长度必须出现在字段名里（Vol_60d / Beta_250d），不能只写在脚注。
+# 同一个 Beta 用 60 日和 250 日算能差 0.4 以上，读的人必须一眼看到口径。
+# 这里【不做任何 shrinkage / 平滑】——一平滑就从测量变成模型了。
+windows:
+  vol_days: 60             # 已实现波动率
+  downside_days: 60        # 下行波动（对 0 的半标准差）
+  beta_days: 250           # Beta（对基准）
+  corr_days: 60            # 与基准的相关性
+  maxdd_days: 250          # 最大回撤回看（≈1年）
+  ma_days: 120             # 均线
+  trail_lookback: 250      # 尾随收益回看
+  trail_skip: 21           # 尾随收益跳过最近 N 日（12-1 口径）
+
+# ---------------- 百分位 ----------------
+percentile:
+  # 行业内可用样本 < min_sector_n 时，回退到全域百分位，并在报告里标 (universe)。
+  # 理由：GICS 11 个行业分 500 只，小行业只有二十几只；再叠加基本面字段缺失，
+  # 可能只剩个位数。7 只样本里的 "90th" 没有信息量，只会误导。
+  min_sector_n: 15
+  # 全域样本也太小时同样不给百分位。n=1 的 "50th percentile" 是纯噪声，
+  # 但它印出来和 n=500 的 50th 长得一模一样。小池子试跑（CIO_UB_LIMIT）时尤其重要。
+  min_universe_n: 10
+  # 百分位一律按【原始值升序】计算：pct=90 表示该值高于全体 90%。
+  # 不做方向翻转——翻转是判断，测量报告不做判断。
+  ascending: true
+
+# ---------------- 基本面新鲜度 ----------------
+fundamentals:
+  # 季报公司超过 stale_days 天没有新的 accepted filing → 标 STALE。
+  # 100 天 ≈ 一个季度 + 申报宽限期。
+  stale_days: 100
+
+# ---------------- Exceptions 红线 ----------------
+# 只描述"发生了异常状态"，不给任何"因此应该买/卖"的结论。
+exceptions:
+  vol_pctile: 95              # 波动率百分位高于此值
+  downside_pctile: 95         # 下行波动百分位高于此值
+  maxdd_pct: -30.0            # 最大回撤劣于此值（负数）
+  beta: 1.80                  # Beta 高于此值
+  # 【总负债/总资产】百分位高于此值（优先行业口径）。
+  # 注意名字：这是 total liabilities / total assets，不是 debt / assets——
+  # 总负债里还有应付账款、递延收入、租赁与养老金负债等非债务项。
+  # 旧键名 leverage_pctile 仍被兼容读取，但请改用新键。
+  liab_assets_pctile: 90
+  corr_pair: 0.85             # 两只标的日收益相关性高于此值（仅在持仓/关注池内两两比）
+  trend_extended_pct: 25.0    # 价格高于均线的幅度超过此值（"位置极端"，不是"该卖")
+  price_stale_days: 3         # 价格序列落后 as_of 超过 N 个交易日（基本面有 stale，价格也必须有）
+  vol_single_day_share: 0.50  # 单日贡献超过窗口平方和的此比例 → 波动率其实是"一天"，不是分布

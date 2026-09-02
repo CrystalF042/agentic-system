@@ -1,0 +1,145 @@
+# CIO watchlist (US market) — used when CIO_MARKET=us. Mirrors watchlist.yaml structure.
+# US matching relies on keywords_en (case-insensitive), incl. key company names; no A-share codes.
+
+# §8 relevance model — three tiers per sector:
+#   companies  = anchors (the economic subject). A hit needs an anchor (→ Direct),
+#                or 2+ strong themes / a strong theme in the title (→ Sector).
+#   keywords_en = STRONG, sector-defining themes.
+#   weak       = generic terms (FDA, chip, AI, GPU). Corroborate only — NEVER trigger a hit alone.
+# This is what stops "FDA recalls blueberries" → Pharma and "AI" in a farming story → Semis.
+watchlist:
+  Pharmaceuticals:
+    desc: US pharma & biotech (FDA-driven)
+    names_cn: []
+    a_shares: []
+    companies:
+      Eli Lilly: LLY
+      Lilly: LLY
+      Pfizer: PFE
+      Merck: MRK
+      AbbVie: ABBV
+      Johnson & Johnson: JNJ
+      Amgen: AMGN
+      Gilead: GILD
+      Bristol Myers: BMY
+      Novo Nordisk: NVO
+      Vertex: VRTX
+      Regeneron: REGN
+      Moderna: MRNA
+    keywords: []
+    keywords_en: ["clinical trial", "phase 3", "phase 2", "phase 1", oncology, PDUFA,
+                  "breakthrough therapy", "topline data", "drug approval", "clinical results",
+                  GLP-1, "weight loss drug"]
+    weak: [FDA, approval, biotech, pipeline]
+
+  AI:
+    desc: Artificial intelligence (models, compute, applications)
+    names_cn: []
+    a_shares: []
+    companies:
+      Nvidia: NVDA
+      Palantir: PLTR
+      OpenAI: ""
+      Anthropic: ""
+    keywords: []
+    keywords_en: ["artificial intelligence", "large language model", LLM, "generative AI",
+                  "AI capex", "AI infrastructure", "training cluster", hyperscaler, "AI accelerator"]
+    weak: [AI, "AI chip", "AI model", GPU, inference, copilot, "data center"]
+
+  Technology:
+    desc: US big tech (mega-cap platforms)
+    names_cn: []
+    a_shares: []
+    companies:
+      Apple: AAPL
+      Microsoft: MSFT
+      Amazon: AMZN
+      Alphabet: GOOGL
+      Google: GOOGL
+      Meta: META
+      Netflix: NFLX
+      Salesforce: CRM
+      Oracle: ORCL
+      Adobe: ADBE
+    keywords: []
+    keywords_en: ["big tech", "cloud revenue", "cloud computing", "cloud growth",
+                  "advertising revenue", "services revenue", iPhone]
+    weak: [subscription, antitrust, "share buyback"]
+
+  Semiconductors:
+    desc: Semiconductors, foundry & equipment
+    names_cn: []
+    a_shares: []
+    companies:
+      Nvidia: NVDA
+      AMD: AMD
+      Broadcom: AVGO
+      TSMC: TSM
+      ASML: ASML
+      Micron: MU
+      Intel: INTC
+      Qualcomm: QCOM
+      Arm: ARM
+      Marvell: MRVL
+      Applied Materials: AMAT
+      Lam Research: LRCX
+      KLA: KLAC
+    keywords: []
+    keywords_en: [semiconductor, foundry, EUV, "export control", "chip ban", HBM,
+                  "memory chip", "advanced node", "chip export", "AI chip demand"]
+    weak: [chip, GPU, wafer, fab]
+
+# US is the primary market now (not on-demand); multi-market news still gathered globally.
+us_watch_on_demand: false
+
+# Data anchor: US indices lead; keep multi-market (US / HK / JP-KR / China A) per your intent.
+data_anchor:
+  US: {"Dow Jones": "^DJI", "S&P 500": "^GSPC", "Nasdaq": "^IXIC", "PHLX Semi": "^SOX"}
+  HK: {"Hang Seng": "^HSI", "HS Tech": "HSTECH.HK"}
+  Japan/Korea: {"Nikkei 225": "^N225", "KOSPI": "^KS11"}
+# China A（上证综指 / 沪深300）已按 CEO 指示移除：美股盘前不要任何 A 股内容。
+# HK / Japan/Korea 保留 —— 那是**隔夜亚洲收盘**，美股开盘前的常规参照，
+# 和"中国财经报道"不是一回事。想连这两组一起去掉，删上面两行即可。
+
+# Trend lenses (US-oriented English keywords).
+trend_lenses:
+  Flows:
+    score: 5
+    keywords: []
+    keywords_en: ["net inflow", "net outflow", "fund flow", "share buyback", "stock buyback",
+                  "13F", "insider buying", "insider selling", "block trade", "ETF inflow",
+                  "ETF outflow", "options flow"]
+  Policy:
+    score: 5
+    keywords: []
+    keywords_en: ["Federal Reserve", "the Fed", FOMC, "rate cut", "rate hike", "interest rate",
+                  regulation, tariff, sanction, "export control", antitrust, SEC, "CHIPS Act",
+                  subsidy, "government shutdown"]
+  Revisions:
+    score: 4
+    keywords: []
+    keywords_en: [upgrade, downgrade, "price target", "raised guidance", "cut guidance",
+                  "beats estimates", "misses estimates", "initiated coverage", "profit warning",
+                  "analyst rating", "estimate revision"]
+  Anomaly:
+    score: 4
+    keywords: []
+    keywords_en: [surge, plunge, "halted", "circuit breaker", tumble, soar, spike, selloff,
+                  "after hours", "premarket move", "52-week high", "52-week low"]
+  Filings:
+    score: 3
+    keywords: []
+    keywords_en: ["10-K", "10-Q", "8-K", earnings, "earnings call", "quarterly results", filing,
+                  merger, acquisition, dividend, guidance, "stock split", "S-1", IPO]
+
+signal_ranking:
+  strong_cap: 6
+  strong_ratio: 0.12
+  strong_floor: 9
+  medium_floor: 5
+
+# Noise / clickbait (English). Hit → heavy penalty, excluded from BLUF and "strong".
+noise_keywords: ["you won't believe", "shocking", "skyrocket", "explodes", "this one stock",
+                 "millionaire", "must buy", "screaming buy", "genius", "guru", "secret",
+                 "will make you rich", "next big thing", "everyone is buying", "mind-blowing"]
+noise_penalty: 5

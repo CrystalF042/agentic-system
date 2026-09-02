@@ -1,0 +1,75 @@
+# =============================================================================
+#  READ THIS BEFORE `git init`
+#
+#  Everything below contains either SECRETS or REAL PORTFOLIO DATA.
+#  Git keeps history: once a file is committed, deleting it later does NOT
+#  remove it from the repository. The order matters —
+#
+#      1. write this file      2. git init      3. git add .
+#
+#  If you have already committed any of these, do not just delete them.
+#  Rotate the Telegram token and start a fresh repository.
+# =============================================================================
+
+# ---- Secrets -----------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.*
+
+# ---- Real data: positions, thesis ledger, sizing lineage ---------------------
+*.db
+*.db-journal
+*.db.bak*
+cio.db
+cfo.db
+
+# ---- Research archives (your own work, not for publication) ------------------
+raw-data/
+Company Archive/
+Topic Archive/
+memory/
+out/
+logs/
+lancedb/
+research/
+MEMORY.md
+
+# ---- Local environments ------------------------------------------------------
+.venv/
+.venv-ui/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# ---- OS / editor -------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+
+# ---- Generated ---------------------------------------------------------------
+*.pdf
+!assets/**/*.pdf
+
+# ---- Editor backups ----------------------------------------------------------
+*.bak
+*.bak[0-9]*
+
+# ---- Local caches ------------------------------------------------------------
+.sec_tickers.json
+.cache/
+
+# ---- Fonts: 33 MB of TTF, 94% of the repo ------------------------------------
+#  Noto Sans SC is OFL-licensed and free to redistribute, but committing 33 MB
+#  into git makes every clone slow forever. They are only needed to render
+#  Chinese PDFs. Download instructions are in the README.
+assets/fonts/*.ttf
