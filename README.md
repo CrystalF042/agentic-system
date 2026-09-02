@@ -5,11 +5,6 @@ A multi-agent equity research system that runs on one machine. It replaces the
 authority. Every number is computed by deterministic code; language models are
 used only where language is the actual problem.
 
-**Its most unusual property is that it declines to produce an opinion on most days.**
-In an expanded scan across five semiconductor names, most names produced zero
-substantive events after deduplication and the system abstained on them. Abstention
-is the common outcome, and it is the design rather than a failure mode.
-
 > **Not investment advice.** Research and paper portfolios only. No broker
 > integration, no order routing. See [Scope and limits](#scope-and-limits).
 
