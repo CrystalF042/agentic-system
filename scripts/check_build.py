@@ -3629,6 +3629,13 @@ def _b124_a_failed_call_never_becomes_an_argument():
         return False
     keep_env = {k: _os.environ.get(k) for k in
                 ("CIO_DEBATE_ENGINE", "CIO_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY")}
+    # **`settings.MOCK_LLM` 是导入时算好的，动环境变量它不跟着变。**
+    # 不显式关掉的话，开发机 .env 里写着 CIO_MOCK_LLM=1 时引擎走 mock 分支、
+    # 什么都不抛 —— 于是下面「失败必须抛」那几条在有 .env 的机器上红、
+    # 在没有的机器上绿。**一条只在一种环境下成立的断言，等于没有断言。**
+    from cio.config import settings as _st
+    keep_mock = _st.MOCK_LLM
+    _st.MOCK_LLM = False
     try:
         _os.environ.pop("CIO_DEBATE_ENGINE", None)
         if _llm.parse_spec() != ("ollama", "gpt-oss:20b"):
@@ -3680,6 +3687,7 @@ def _b124_a_failed_call_never_becomes_an_argument():
         finally:
             _hx.post = real_post
     finally:
+        _st.MOCK_LLM = keep_mock
         for k, v in keep_env.items():
             if v is None:
                 _os.environ.pop(k, None)

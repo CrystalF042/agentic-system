@@ -44,15 +44,31 @@ def check(name, fn):
 
 
 def _env(**kw):
-    """临时改环境变量。"""
+    """临时改环境变量。
+
+    **`CIO_MOCK_LLM` 要同时改 `settings.MOCK_LLM`。**
+
+    `settings` 是**导入时**从 `.env` 算好的，之后再动环境变量它不会跟着变。
+    只 pop 环境变量的话：开发机的 `.env` 里写着 `CIO_MOCK_LLM=1` 时，
+    引擎照样走 mock 分支、什么都不抛，于是「失败必须抛异常」那几条
+    **在有 .env 的机器上红、在没有的机器上绿**。
+
+    那正是这个项目里反复出现的形状：**一条只在一种环境下成立的断言，
+    等于没有断言。** 这条是被一次全新安装当场抓到的。
+    """
+    from cio.config import settings as _st
+
     class _C:
         def __enter__(self):
             self.keep = {k: os.environ.get(k) for k in kw}
+            self.keep_mock = _st.MOCK_LLM
             for k, v in kw.items():
                 if v is None:
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
+            if "CIO_MOCK_LLM" in kw:
+                _st.MOCK_LLM = (kw["CIO_MOCK_LLM"] == "1")
             return self
 
         def __exit__(self, *a):
@@ -61,6 +77,7 @@ def _env(**kw):
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
+            _st.MOCK_LLM = self.keep_mock
             return False
     return _C()
 
@@ -426,18 +443,20 @@ def t_the_thesis_records_which_engine_wrote_it():
 def t_mock_mode_costs_nothing_and_touches_no_network():
     """`CIO_MOCK_LLM=1` 时不调任何东西 —— 测试里 socket 是焊死的。"""
     with _env(CIO_MOCK_LLM="1", CIO_DEBATE_ENGINE="claude:claude-sonnet-5"):
-        import importlib
-        import cio.config as cfg
-        importlib.reload(cfg)
-        importlib.reload(llm)
         eng = llm.engine()
         out = eng.chat("你好", system="s")
         assert out.startswith("[MOCK]"), out
         assert eng.usage.calls == 1 and eng.usage.usd == 0.0, eng.usage.to_dict()
-    import importlib
-    import cio.config as cfg
-    importlib.reload(cfg)
-    importlib.reload(llm)
+    # **反过来也要成立**：mock 关掉、没 key，就必须抛。
+    # 只测「开着 mock 不花钱」的话，一台 .env 里写死 CIO_MOCK_LLM=1 的机器上
+    # 整套用例都会安静地什么都不验。
+    with _env(CIO_MOCK_LLM="0", CIO_DEBATE_ENGINE="claude:claude-sonnet-5",
+              CIO_ANTHROPIC_API_KEY="", ANTHROPIC_API_KEY=""):
+        try:
+            llm.engine().chat("你好", system="s")
+            raise AssertionError("mock 关掉、没 key，却没抛")
+        except llm.EngineError:
+            pass
 
 
 TESTS = [
