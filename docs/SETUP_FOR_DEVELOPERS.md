@@ -41,6 +41,7 @@ produces an answer, you have broken it.
 | **Python 3.9** | The owner's machine runs 3.9. Code that only works on 3.10+ will break there. | `python3 --version` |
 | **git** | To get the code and send changes back | `git --version` |
 | A terminal | macOS: Terminal.app. Windows: use WSL or Git Bash. | |
+| **Ollama** (optional) | Only if you will run models locally — see section 6 first | `ollama --version` |
 
 ### Python 3.9 is a hard requirement, not a preference
 
@@ -124,7 +125,7 @@ What they do, and why they matter:
 > real Telegram token. Git keeps history: once a file is committed, deleting it
 > later does **not** remove it from the repository — anyone who clones gets it.
 >
-> `.gitignore` already excludes `.env`, and there is a gate (section 8) that
+> `.gitignore` already excludes `.env`, and there is a gate (section 9) that
 > verifies this before every push. Run the gate. Do not rely on remembering.
 
 ---
@@ -238,7 +239,159 @@ data and takes several minutes. Use `--dry-run` and the test suites instead.
 
 ---
 
-## 6. Connecting the Claude API key
+## 6. Local models (Ollama)
+
+### 6.1 Do you actually need this?
+
+Read the table before installing 14 GB of anything.
+
+| What you are doing | Ollama needed? |
+| --- | --- |
+| Reading code, writing code, running the test suites | **No.** `CIO_MOCK_LLM=1` handles it |
+| `research_run.py --dry-run` | **No.** A rehearsal never calls a model |
+| Running the real pipeline with `CIO_DEBATE_ENGINE=claude:...` | **Partly** — see 6.2 |
+| Running the real pipeline with no `CIO_DEBATE_ENGINE` set | **Yes** — the debate runs locally |
+| Running the morning brief (`run_premarket.py`) | **Yes** |
+| Reproducing the owner's machine exactly | **Yes** |
+
+Most development work needs none of this. Install it when you are working on
+something that genuinely exercises a model, not before.
+
+### 6.2 "Partly" — the part people miss
+
+Switching the debate to Claude does **not** remove every local model call.
+`unit_a.build_unit_a()` calls `process.hydrate()`, which uses the **light** model
+to write one-sentence summaries of the news it collected. That call is separate
+from the debate engine and still goes to Ollama.
+
+And here is the part worth knowing: **if Ollama is not running, that call fails
+quietly.** It falls back to returning the original headline. Nothing crashes,
+nothing turns red, and the report just contains raw headlines instead of
+summaries. If you ever see summaries that are word-for-word the headline, that is
+what happened — check whether Ollama is up before looking for a bug in the code.
+
+(The debate path is different: it is `strict`, so it raises. Section 7 explains
+why those two paths deliberately behave differently.)
+
+### 6.3 What the three models are for
+
+| Env var | Default model | Used for | Download |
+| --- | --- | --- | --- |
+| `CIO_MODEL_BRIEF` | `gpt-oss:20b` | Local debate; the morning brief's lead items | **~14 GB** |
+| `CIO_MODEL_LIGHT` | `phi4-mini` | Translation, one-line summaries, classification | ~2.5 GB |
+| `CIO_MODEL_EMBED` | `nomic-embed-text-v2-moe` | Embeddings for topic search and dedup | ~1 GB |
+
+**Hardware reality check for `gpt-oss:20b`:** ~14 GB download, and it needs
+roughly that much memory to run. On an Apple Silicon Mac, 16 GB unified memory is
+the tight minimum, 24 GB is comfortable. If your machine has 8 GB, do not pull it
+— use `CIO_MOCK_LLM=1` for development and Claude for the debate.
+
+### 6.4 Install Ollama
+
+**macOS** — either download the app from https://ollama.com/download, or:
+
+```
+brew install ollama
+```
+
+Then start it. The app version runs in the menu bar automatically. If you
+installed via brew, start the server in its own terminal window and leave it open:
+
+```
+ollama serve
+```
+
+**Linux:**
+
+```
+curl -fsSL https://ollama.com/install.sh | sh
+```
+
+**Windows:** download the installer from https://ollama.com/download, or run the
+whole project under WSL2 and follow the Linux instructions.
+
+Confirm the server is up:
+
+```
+curl http://127.0.0.1:11434/api/tags
+```
+
+You want JSON back (probably `{"models":[]}` at this point). If you get
+`Connection refused`, Ollama is not running.
+
+### 6.5 Pull the models — small ones first
+
+Start with the two small ones. They cover the summary and embedding paths, which
+is what most development actually touches:
+
+```
+ollama pull phi4-mini
+ollama pull nomic-embed-text-v2-moe
+```
+
+Only pull the big one if you are going to run the debate locally:
+
+```
+ollama pull gpt-oss:20b
+```
+
+That is a ~14 GB download. It will take a while.
+
+> If any `ollama pull` fails with a 404, the model name has moved. Do not
+> guess — search https://ollama.com/library for the current tag, pull that, and
+> point the matching `CIO_MODEL_*` variable in `.env` at it. Every model name in
+> this project is an env var precisely so this is a config change, not a code change.
+
+Check what you have:
+
+```
+ollama list
+```
+
+### 6.6 Verify it works from inside the project
+
+This calls the light model through the project's own client, in **strict** mode,
+so a failure is loud instead of silent:
+
+```
+.venv/bin/python -c "
+import sys; sys.path.insert(0, 'src')
+from cio.ollama_client import get_ollama
+print(get_ollama().chat('Reply with the two characters OK', model='phi4-mini', strict=True)[:80])
+"
+```
+
+Expect a short reply containing `OK`. If you get an exception mentioning
+`Connection refused`, Ollama is not running. If you get a 404, that model is not
+pulled.
+
+To confirm which engine the debate will use:
+
+```
+.venv/bin/python scripts/research_run.py --status
+```
+
+```
+辩论引擎 ollama:gpt-oss:20b　—— 本地，材料不出本机
+```
+
+("Debate engine ollama:gpt-oss:20b — local, material does not leave this machine.")
+
+### 6.7 Remember to turn mock mode off
+
+`CIO_MOCK_LLM=1` short-circuits **every** model call, local and remote. With it
+on, you can install Ollama, pull 14 GB, and never touch it — and everything will
+appear to work. When you want to actually exercise a model, set:
+
+```
+CIO_MOCK_LLM=0
+```
+
+and turn it back to `1` when you go back to writing code.
+
+---
+
+## 7. Connecting the Claude API key
 
 The owner will give you a key that looks like `sk-ant-api03-...`.
 
@@ -305,7 +458,7 @@ so the pipeline "keeps going," this is the failure mode you would be recreating.
 
 ---
 
-## 7. Connecting Telegram
+## 8. Connecting Telegram
 
 Telegram is how "N proposals awaiting your approval" reaches the owner's phone.
 **You almost certainly do not need to set this up** — keep `CIO_TG_DRYRUN=1` and
@@ -355,16 +508,16 @@ If you are ever given it by accident, tell her so she can revoke it
 
 ---
 
-## 8. Sending your changes back — the workflow
+## 9. Sending your changes back — the workflow
 
-### 8.1 Always start from the latest code
+### 9.1 Always start from the latest code
 
 ```
 cd agentic-system
 git pull origin main
 ```
 
-### 8.2 Work on a branch, not on `main`
+### 9.2 Work on a branch, not on `main`
 
 ```
 git checkout -b your-change-name
@@ -372,7 +525,7 @@ git checkout -b your-change-name
 
 Use a name that says what it is: `fix-sector-headroom`, `add-liquidity-cap`.
 
-### 8.3 Before every commit, run three things
+### 9.3 Before every commit, run three things
 
 This is not optional and it is not a formality. In order:
 
@@ -405,7 +558,7 @@ The secrets gate. It checks five things:
 **If [4] is ever red, stop and tell the owner immediately.** Deleting the file
 does not help — the key must be rotated and the repository rebuilt.
 
-### 8.4 Commit and push
+### 9.4 Commit and push
 
 ```
 git add -A
@@ -424,7 +577,7 @@ git push -u origin your-change-name
 Then open a Pull Request on GitHub so the owner can review before it lands on
 `main`.
 
-### 8.5 If push is rejected
+### 9.5 If push is rejected
 
 ```
 ! [rejected]  main -> main (non-fast-forward)
@@ -448,48 +601,48 @@ and ask before proceeding.
 
 ---
 
-## 9. How to work on this codebase without breaking it
+## 10. How to work on this codebase without breaking it
 
 The invariants below are not style preferences. Each one exists because the
 opposite behaviour shipped once and caused a real, silent failure.
 
-### 9.1 Never let a failure return something that looks like a result
+### 10.1 Never let a failure return something that looks like a result
 
 The rule: on failure, **raise**. Let the caller record it and move on. A
 degraded return value that is shaped like a success is the single most expensive
 class of bug in this system, because nothing anywhere reports it.
 
-### 9.2 Zero is a conclusion; blank is not
+### 10.2 Zero is a conclusion; blank is not
 
 `0 triggers` is information. An empty line is ambiguous. Every counter prints
 even when it is zero.
 
-### 9.3 A warning that is always on is the same as no warning
+### 10.3 A warning that is always on is the same as no warning
 
 If an alert would fire on the most common normal day, it is not an alert. Before
 adding one, ask: what fraction of days does this fire on? If the answer is
 "most," people will learn to ignore it, and it will also be ignored on the day
 it matters.
 
-### 9.4 Two copies of the same logic means one of them is untested
+### 10.4 Two copies of the same logic means one of them is untested
 
 If you find yourself writing the same decision in two places, extract it. The
 copy your test happens to exercise will stay correct; the other will drift, and
 it will be the one that actually runs.
 
-### 9.5 Assert on structure, not on text
+### 10.5 Assert on structure, not on text
 
 `assert "engine" in source_code` can be satisfied by a **comment**. Use the `ast`
 module and assert on the actual call. This mistake has been made repeatedly here,
 including in code written last week.
 
-### 9.6 A test that cannot fail is worse than no test
+### 10.6 A test that cannot fail is worse than no test
 
 It reports "this is covered" when nothing is. When you add a test, break the
 code on purpose and confirm the test goes red. If it stays green, the test is
 decorative.
 
-### 9.7 Never change the meaning of a stored field without bumping its version
+### 10.7 Never change the meaning of a stored field without bumping its version
 
 Fields carry `SCHEMA_VERSION` constants. Adding a field is fine. Changing what an
 existing field means requires a version bump, otherwise old and new records mix
@@ -497,7 +650,7 @@ in the same table and no one can tell which is which.
 
 ---
 
-## 10. Where things live
+## 11. Where things live
 
 ```
 src/cio/
@@ -538,7 +691,7 @@ Most of the surprising-looking code is there because something broke.
 
 ---
 
-## 11. The one boundary you must not cross
+## 12. The one boundary you must not cross
 
 There is exactly one hard gate in this system:
 
@@ -563,7 +716,7 @@ proposal is approved for a year. Do not "streamline" it.
 
 ---
 
-## 12. If you get stuck
+## 13. If you get stuck
 
 Report these three things and someone can usually tell you what happened:
 
