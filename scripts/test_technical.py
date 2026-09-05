@@ -664,43 +664,155 @@ def t_store_never_silently_rewrites_history():
 
 
 def t_review_is_the_screen_kpi_and_it_is_recorded():
-    """**筛子的主 KPI 要有地方记。**
+    """**筛子的主 KPI 要有地方记，而且要记得住"什么时候判的"。**
 
-    "推出来的值不值得研究"今天就能测，但前提是有人把判断写下来。
-    在复核台账出现之前，筛子好不好用只能靠印象——而印象会被最近一次的
-    成败带着走。
+    "推出来的值不值得研究"今天就能测，但只有在**判的时候还看不见后续走势**
+    的前提下才算数。她定的规格：
+
+        reviewed_at 自动填市场时区 → review_lag_trading_days（交易日，不是日历天）
+        → clean / t1 / retrospective 分开统计 → 主 KPI 只看 clean
+        → excluded 独立一档，不进分母
+        → 同判定重复 mark 幂等，不再靠 stats() 事后去重
     """
+    import json
     import tempfile
     from pathlib import Path as _P
     from cio.technical import review as rv
     with tempfile.TemporaryDirectory() as tmp:
-        old = rv.REVIEW_PATH
+        old_p, old_l = rv.REVIEW_PATH, rv.LEGACY_REVIEW_PATH
         try:
             rv.REVIEW_PATH = _P(tmp) / "reviews.jsonl"
-            rv.mark("2026-09-01", "A", "worth", "财报后放量")
-            rv.mark("2026-09-02", "B", "skip", "指数调仓")
-            # **三档都要有**：逼人二选一会把犹豫记成假的确定
-            rv.mark("2026-09-03", "C", "unclear")
-            assert set(rv.VERDICTS) == {"worth", "skip", "unclear"}
+            rv.LEGACY_REVIEW_PATH = _P(tmp) / "nonexistent.jsonl"
+
+            # 一、三档判断 + 非法判定被拒
+            r = rv.mark("2026-09-04", "A", "worth", "财报后放量")
+            assert r["action"] == "written", r
+            rv.mark("2026-09-04", "B", "skip", "指数调仓")
+            rv.mark("2026-09-04", "C", "unclear")
+            assert set(rv.JUDGEMENTS) == {"worth", "skip", "unclear"}
             try:
                 rv.mark("2026-09-04", "D", "会涨")
                 raise AssertionError("非法判定被收下了")
             except ValueError:
                 pass
-            st = rv.stats()["deduped"]
-            box = st[rv.SETUP_VERSION]
-            assert box == {"worth": 1, "skip": 1, "unclear": 1}, box
-            # 改主意：追加一条，两条都在，而且改过要看得见
-            rv.mark("2026-09-02", "B", "worth", "回头看错了")
-            assert rv.latest()[("2026-09-02", "B")]["verdict"] == "worth"
-            assert rv.revisions() == [(("2026-09-02", "B"), "skip", "worth")]
-            assert rv.stats()["deduped"][rv.SETUP_VERSION]["skip"] == 0, "去重后旧判定还在计数"
-            assert rv.stats()["all_records"][rv.SETUP_VERSION]["skip"] == 1, "原始记录被抹了"
-            # 待复核
-            hits = [("2026-09-01", "A"), ("2026-09-05", "E")]
-            assert rv.pending(hits) == [("2026-09-05", "E")]
+
+            # 二、**reviewed_at 自动填，且是市场时区的 offset-aware ISO**
+            assert r["reviewed_at"], "没有自动记录复核时间"
+            assert ("+" in r["reviewed_at"][10:] or "-" in r["reviewed_at"][10:]), \
+                f"不是带偏移量的 ISO：{r['reviewed_at']}"
+            assert "T" in r["reviewed_at"], r["reviewed_at"]
+
+            # **必须跟市场时区，不跟机器时区。**
+            # 这条得把机器时区**掰到和市场不一样**才有判别力：跑测试的机器
+            # 本来就在美东时，两者偏移量相同，用机器时间的实现照样绿。
+            #
+            # 掰去哪儿**不能写死**。写死 Asia/Shanghai，`CIO_MARKET=cn`
+            # （不设这个变量时的默认值）下市场时区本来就是 +08:00 ——
+            # 那句"不等于 +08:00"会把正确实现判成错的，而且那种情形下
+            # 它对"跟着机器走"根本没有判别力。所以挑一个**此刻偏移量确实
+            # 和市场不同**的时区，再和机器实际偏移量比。
+            import datetime as _dt
+            import os as _os
+            import time as _time
+            from zoneinfo import ZoneInfo as _ZI
+            from cio.schedule import market_now
+            _mkt_off = market_now().utcoffset()
+            _other = next((z for z in ("UTC", "Asia/Shanghai",
+                                       "America/New_York", "Asia/Kolkata",
+                                       "Pacific/Kiritimati")
+                           if _dt.datetime.now(_ZI(z)).utcoffset() != _mkt_off),
+                          None)
+            assert _other, "找不到一个和市场偏移量不同的时区，这条断言无从判别"
+            _keep = _os.environ.get("TZ")
+            try:
+                _os.environ["TZ"] = _other
+                if hasattr(_time, "tzset"):
+                    _time.tzset()
+                    machine = _dt.datetime.now().astimezone().isoformat()[-6:]
+                    want = market_now().isoformat()[-6:]
+                    got = rv.market_stamp()[-6:]
+                    assert got == want, \
+                        f"复核时间戳跟着机器时区走了（机器 {machine}，市场 {want}，拿到 {got}）"
+                    assert got != machine, got
+            finally:
+                if _keep is None:
+                    _os.environ.pop("TZ", None)
+                else:
+                    _os.environ["TZ"] = _keep
+                if hasattr(_time, "tzset"):
+                    _time.tzset()
+
+            # 三、**延迟按交易日算：周五信号、周一复核 = 1，不是 3**
+            assert rv.trading_days_between(
+                "2026-09-04", "2026-09-07T06:00:00-04:00") == 1
+            assert rv.trading_days_between(
+                "2026-09-04", "2026-09-04T20:00:00-04:00") == 0
+            assert rv.trading_days_between(
+                "2026-09-03", "2026-09-04T09:00:00-04:00") == 1
+            assert rv.trading_days_between("2026-09-04", "") is None
+            # 复核早于信号说不通 —— **不猜，返回 None**
+            assert rv.trading_days_between(
+                "2026-09-04", "2026-09-01T09:00:00-04:00") is None
+
+            # 四、**同判定重复 mark 不写第二行**（不再靠 stats 事后去重）
+            n_before = len(rv.REVIEW_PATH.read_text("utf-8").splitlines())
+            again = rv.mark("2026-09-04", "A", "worth", "再来一次")
+            assert again["action"] == "unchanged", again
+            n_after = len(rv.REVIEW_PATH.read_text("utf-8").splitlines())
+            assert n_after == n_before, "同判定被重复写进了台账"
+
+            # 改判定才追加，并且带上原判定
+            rev = rv.mark("2026-09-04", "B", "worth", "回头看错了")
+            assert rev["action"] == "revised", rev
+            assert rev["previous_verdict"] == "skip", rev
+            assert rv.latest()[("2026-09-04", "B")]["verdict"] == "worth"
+            assert rv.revisions() == [(("2026-09-04", "B"), "skip", "worth")]
+
+            # 五、**excluded 独立一档，必须写理由，且不进分母**
+            try:
+                rv.mark("2026-09-01", "E", "excluded", "")
+                raise AssertionError("没写理由的 excluded 被收下了")
+            except ValueError as e:
+                assert "理由" in str(e), str(e)
+            rv.mark("2026-09-01", "E", "excluded", rv.RETROSPECTIVE_CONTAMINATION)
+
+            # 六、分桶：只有当天判的进主 KPI
+            rv.mark("2026-09-03", "F", "worth", "隔天才看",
+                    reviewed_at="2026-09-04T09:00:00-04:00")
+            by_lag = rv.stats()["by_lag"][rv.SETUP_VERSION]
+            assert by_lag["clean"]["worth"] == 2, by_lag        # A, B(改判后)
+            assert by_lag["t1"]["worth"] == 1, by_lag           # F
+            assert by_lag["retrospective"]["excluded"] == 1, by_lag  # E
+            rate, n = rv.worth_rate(by_lag["clean"])
+            assert n == 3 and abs(rate - 2 / 3) < 1e-9, (rate, n)
+            # **excluded 不进分母**
+            r2, n2 = rv.worth_rate(by_lag["retrospective"])
+            assert n2 == 0 and r2 is None, (r2, n2)
+
+            # 七、**没有分母时返回 None，不是 0%**
+            assert rv.worth_rate({"worth": 0, "skip": 0, "unclear": 0}) == (None, 0)
+
+            # 八、老记录没有 reviewed_at → unknown，**不许并进 clean**
+            rows = [json.loads(x) for x in
+                    rv.REVIEW_PATH.read_text("utf-8").splitlines() if x.strip()]
+            rows.append({"as_of": "2026-08-20", "symbol": "OLD", "verdict": "worth",
+                         "note": "老台账", "setup_id": rv.SETUP_ID,
+                         "setup_version": rv.SETUP_VERSION, "reviewed_at": ""})
+            rv.REVIEW_PATH.write_text(
+                "\n".join(json.dumps(x, ensure_ascii=False) for x in rows) + "\n",
+                "utf-8")
+            by_lag = rv.stats()["by_lag"][rv.SETUP_VERSION]
+            assert by_lag["unknown"]["worth"] == 1, by_lag
+            assert by_lag["clean"]["worth"] == 2, \
+                "没有时间戳的老记录被并进了主 KPI —— 我们没有证据说它是当天判的"
+
+            # 九、excluded 之后就不在待复核队列里了
+            assert ("2026-09-01", "E") not in rv.pending(
+                [("2026-09-01", "E"), ("2026-09-04", "Z")])
+            assert ("2026-09-04", "Z") in rv.pending(
+                [("2026-09-01", "E"), ("2026-09-04", "Z")])
         finally:
-            rv.REVIEW_PATH = old
+            rv.REVIEW_PATH, rv.LEGACY_REVIEW_PATH = old_p, old_l
 
 
 def t_snapshot_runs_after_the_close():
@@ -722,17 +834,33 @@ def t_snapshot_runs_after_the_close():
     import ast
     src = (Path(__file__).resolve().parents[1] / "scripts"
            / "technical_snapshot.py").read_text("utf-8")
-    fn = next(n for n in ast.walk(ast.parse(src))
+    tree = ast.parse(src)
+    fn = next(n for n in ast.walk(tree)
               if isinstance(n, ast.FunctionDef) and n.name == "main")
-    gate = work = None
-    for n in ast.walk(fn):
-        if isinstance(n, ast.Call):
-            nm = getattr(n.func, "attr", getattr(n.func, "id", ""))
-            if nm == "is_snapshot_time" and gate is None:
-                gate = n.lineno
-            if nm in ("get_universe", "get_history") and work is None:
-                work = n.lineno
-    assert gate and work and gate < work, "收盘闸没跑在取数之前"
+
+    def _calls(node):
+        out = {}
+        for n in ast.walk(node):
+            if isinstance(n, ast.Call):
+                nm = getattr(n.func, "attr", getattr(n.func, "id", ""))
+                out.setdefault(nm, n.lineno)
+        return out
+
+    # build119 之后取数搬进了 `_snapshot_body`，闸门留在 `main`。
+    # 所以这条断言跨两个函数，而且**比原来更强**：
+    # 不只是"闸在取数之前"，而是"main 里根本够不到取数，
+    # 唯一的入口是那个被闸门守着的函数"。
+    mc = _calls(fn)
+    assert "is_snapshot_time" in mc, "main 里没有收盘闸"
+    assert "_snapshot_body" in mc, "main 不再调用取数那一段？结构变了，这条要重写"
+    assert mc["is_snapshot_time"] < mc["_snapshot_body"], "收盘闸没跑在取数之前"
+    for banned in ("get_universe", "get_history"):
+        assert banned not in mc, \
+            f"main 里直接取数（{banned}）—— 那条路绕开了收盘闸"
+    body_fn = next(n for n in ast.walk(tree)
+                   if isinstance(n, ast.FunctionDef) and n.name == "_snapshot_body")
+    bc = _calls(body_fn)
+    assert "get_universe" in bc, "取数不在被守着的那个函数里"
 
 
 def t_universe_pit_is_judged_per_window():
@@ -802,6 +930,835 @@ def t_stored_cards_keep_their_own_versions():
             sto.CARD_DIR = old
 
 
+def t_nan_is_the_third_state():
+    """**NaN 既不是 None 也不是数 —— v1 漏掉的第三种状态。**
+
+    2026-09-02 全市场 502 只那一跑暴露：一根缺量的 K 线让 `cmf_20` /
+    `obv_slope_20` / `up_down_volume_ratio_20` 全变 NaN，而
+
+        reasons 里什么都不写      NaN 不是 None，`is None` 漏过
+        evaluate() 判 False       `NaN > 0.10` 静默返回 False
+        unknown 是空的            于是"算不出来"被记成了"不成立"
+
+    任何一只票只要有一根坏 K 线，就被无声地排除在命中之外。
+    """
+    from cio.technical import numbers as num
+    from cio.technical import setups as st
+    assert num.finite(float("nan")) is None
+    assert num.finite(float("inf")) is None
+    assert num.finite(None) is None
+    assert num.finite(0.0) == 0.0, "0 是一个真实的数，不能被当成算不出来"
+    assert num.finite(True) is True, "布尔字段不该被当成数处理"
+
+    df = zigzag(300)
+    bad = df.copy()
+    bad.loc[290, "volume"] = float("nan")
+    card = ob.observe(bad, symbol="X")           # strict=True：缺原因会直接炸
+    for k in ("cmf_20", "obv_slope_20", "up_down_volume_ratio_20"):
+        assert card.volume[k] is None, f"{k} 还是 NaN：{card.volume[k]}"
+        assert k in card.reasons, f"{k} 是 null 但没写原因"
+    r = st.evaluate(card)
+    assert r["hit"] is False
+    assert "B_accumulation_proxy" in r["unknown"], \
+        "NaN 被静默判成'不成立'，没有进 unknown"
+
+
+def t_panel_health_counts_but_does_not_repair():
+    """**面板体检只数，不修。**
+
+    补一根插值出来的 K 线会让所有度量都算得出来、而且看不出是补的——
+    那比留一个 null 糟得多。
+    """
+    from cio.technical import numbers as num
+    df = zigzag(60)
+    counts, problems = num.panel_health(df)
+    assert counts["rows"] == 60 and not problems, (counts, problems)
+
+    dirty = df.copy()
+    dirty.loc[10, "volume"] = float("nan")
+    dirty.loc[20, "volume"] = 0.0
+    dirty.loc[30, "close"] = -1.0
+    dirty.loc[40, ["high", "low"]] = [90.0, 110.0]     # high < low
+    counts, problems = num.panel_health(dirty)
+    assert counts["nan_rows"] == 1, counts
+    assert counts["nonpositive_volume"] == 1, counts
+    assert counts["nonpositive_close"] == 1, counts
+    assert counts["inverted_bars"] == 1, counts
+    assert len(problems) == 4, problems
+    # 体检结果要出现在卡片上，否则等于没查
+    card = ob.observe(dirty, symbol="X")
+    assert card.panel_health["nan_rows"] == 1
+    assert "panel_health" in card.reasons
+
+
+def t_scrub_is_exhaustive_including_nested():
+    """**兜底必须是穷举的。** 逐个函数去包，新加一个度量就会漏一次，
+    而漏了不报错。所以 `scrub` 递归洗整块，`observe` 再兜一道。"""
+    from cio.technical import numbers as num
+    vals = {"a": float("nan"), "b": 1.0, "c": None,
+            "nested": {"x": float("inf"), "y": 2.0}}
+    why: dict = {}
+    num.scrub(vals, why)
+    assert vals["a"] is None and vals["nested"]["x"] is None
+    assert vals["b"] == 1.0 and vals["nested"]["y"] == 2.0
+    assert "a" in why and "nested.x" in why, why
+    # observe 那一道兜底真的跑了（源码结构）
+    src = (TECH_DIR / "observer.py").read_text("utf-8")
+    assert "scrub(getattr(card, name), card.reasons)" in src, "observe 没有兜底 scrub"
+
+
+def t_setup_version_moved_even_though_thresholds_did_not():
+    """**数字没变，行为变了，版本也必须变。**
+
+    这是她自己那条血统论证的第一次实际应用：`setup_version` 的身份
+    不只是三个阈值。NaN 处理改了之后，同一天同一只票可能给出不同结果，
+    两版的事件不能混在一起统计。
+    """
+    from cio.technical import setups as st
+    assert st.SETUP_VERSION == "setup-1.0.1", st.SETUP_VERSION
+    assert st.params_fingerprint() == st.FROZEN_FINGERPRINT, \
+        "阈值本来就不该变 —— 指纹动了说明改错了东西"
+    src = (TECH_DIR / "setups.py").read_text("utf-8")
+    assert "1.0.0 → 1.0.1" in src and "NaN" in src, \
+        "升版本没写清楚为什么 —— 以后没人知道两版差在哪"
+
+
+def t_v2_gate_decides_whether_rank_decides_who():
+    """**闸门决定有没有，家族分决定先看谁。顺序不能反。**
+
+    家族分是分位平均，中位数恒在 0.5 附近——只用它，">0.5" 每天都是
+    半个市场，系统永远说不出"今天没有"，而那是 v1 的第一条边界。
+    """
+    from cio.technical import score as sc
+    quiet = [ob.observe(zigzag(300, amp=1.0), symbol=f"Q{i}") for i in range(8)]
+    ranked = sc.rank_day(quiet)
+    assert all(not r.passed_gate for r in ranked), "这批不该有通过闸门的"
+    assert all(r.rank is None for r in ranked), "没通过闸门的不该有排名"
+    assert "今天没有" in sc.today_line(ranked), sc.today_line(ranked)
+    assert any(r.score is not None for r in ranked), "分数应当仍然算得出（只是不开门）"
+    # 分档只是标签：拿到 band 不等于进入队列
+    assert any(r.band for r in ranked), "band 应当照常算出来"
+    assert all(r.rank is None for r in ranked if not r.passed_gate)
+
+
+def t_adding_an_indicator_does_not_change_its_family_weight():
+    """**这条是 family 重构存在的全部理由。**
+
+    上一版四个平铺指标里有两个来自 volume 块 —— 量能实际拿了 50% 权重，
+    而文档写着"等权"。再加一个量能指标就变 60%，不报错、看不出来。
+
+    家族化之后：族间等权固定，**往一族里加成员只稀释族内成员**。
+    """
+    from cio.technical import score as sc
+    cards = [ob.observe(zigzag(300, drift=0.02 * (i + 1)), symbol=f"S{i}")
+             for i in range(6)]
+    base = sc.rank_day(cards)
+    in_score = [f for f in sc.FAMILIES if f.in_score]
+    assert len(in_score) >= 4, "进总分的族太少，等权就没意义了"
+
+    # 往 volume 族里塞一个重复成员，族数不变 → 族间权重不变
+    fam = next(f for f in sc.FAMILIES if f.name == "volume")
+    bigger = sc.Family(fam.name, fam.members + (
+        sc.Member("rvol_again", "volume", "rvol_20", sc.HIGHER),), fam.in_score)
+    orig = sc.FAMILIES
+    try:
+        sc.FAMILIES = tuple(bigger if f.name == "volume" else f for f in orig)
+        after = sc.rank_day(cards)
+        assert len([f for f in sc.FAMILIES if f.in_score]) == len(in_score), \
+            "族数变了 —— 那就不是「往族里加成员」了"
+        for a, b in zip(base, after):
+            # 总分可以略变（族内均值被稀释），但**族的个数、因而权重不变**
+            assert set(a.families) == set(b.families), "家族集合变了"
+        # 明确验证权重：总分就是进总分那几族的等权平均
+        r = after[0]
+        got = [r.families[f.name] for f in sc.FAMILIES
+               if f.in_score and r.families.get(f.name) is not None]
+        assert r.score == round(sum(got) / len(got), 4), (r.score, got)
+    finally:
+        sc.FAMILIES = orig
+
+
+def t_directions_and_the_one_judgement_call():
+    """方向：距离越近越靠前、其余越高越靠前；**波动没有方向**。
+
+    `UNUSUAL` 是全文唯一一个不是被定义逼出来的选择——两端的极端都算
+    不寻常，中间靠后。这条写错不会报错，只会让整族悄悄反过来。
+    """
+    from cio.technical import score as sc
+    vals = [0.1, 0.5, 2.0, 10.0]
+    assert sc._percentile_ranks(vals, sc.LOWER)[0] == 1.0
+    assert sc._percentile_ranks(vals, sc.HIGHER)[0] == 0.0
+    un = sc._percentile_ranks([0.0, 0.25, 0.5, 0.75, 1.0], sc.UNUSUAL)
+    assert un[0] == 1.0 and un[-1] == 1.0, f"两端都该靠前：{un}"
+    assert un[2] == 0.0, f"中间该靠后：{un}"
+    # 并列取平均秩
+    tie = sc._percentile_ranks([1.0, 1.0, 2.0], sc.HIGHER)
+    assert tie[0] == tie[1], tie
+    assert sc._percentile_ranks([None, None], sc.HIGHER) == [None, None]
+    # 结构上确认 volatility 用的是非方向聚合
+    volf = next(f for f in sc.FAMILIES if f.name == "volatility_extremeness")
+    assert all(m.direction == sc.UNUSUAL for m in volf.members), \
+        "波动族被赋了方向 —— 那是一个没有依据的假设"
+    zone = next(m for f in sc.FAMILIES for m in f.members
+                if m.field == "atr_to_nearest_zone_above")
+    assert zone.direction == sc.LOWER, "距离的方向写反了"
+
+
+def t_missing_member_is_dropped_not_filled():
+    """**缺的成员直接不算，不补 0、不补 0.5。**
+
+    补 0 把"没数据"变成"这一维很差"，补 0.5 变成"中性"——两个都是
+    凭空造出来的结论。族内全缺时，整族是 None 且不进总分。
+    """
+    from cio.technical import score as sc
+    # 单调上涨 = 没有 swing 点 = 没有价区 → structure 的 zone_distance 必缺
+    cards = [ob.observe(trending_up(300, step=0.1 * (i + 1)), symbol=f"T{i}")
+             for i in range(3)]
+    assert all(c.price_structure.get("atr_to_nearest_zone_above") is None
+               for c in cards), "前提没成立"
+    ranked = sc.rank_day(cards)
+    for r in ranked:
+        assert "zone_distance" in r.missing.get("structure", []), r.missing
+        assert "zone_distance" not in r.members, "缺的成员被填了值"
+        # 没有基准 → relative_strength 整族算不出来，且不进总分
+        assert r.families.get("relative_strength") is None
+        got = [r.families[f.name] for f in sc.FAMILIES
+               if f.in_score and r.families.get(f.name) is not None]
+        assert r.score == round(sum(got) / len(got), 4), (r.score, got)
+
+
+def t_bands_are_labels_not_a_gate():
+    """**分档不能当进入条件。** 中位数恒在 0.5 附近，">0.5" 每天都是半个市场。"""
+    from cio.technical import score as sc
+    assert sc.band_of(0.9) == "HIGH" and sc.band_of(0.75) == "REVIEW"
+    assert sc.band_of(0.55) == "WATCH" and sc.band_of(0.2) == "LOW"
+    assert sc.band_of(None) == ""
+    # 高分但没通过闸门 → 仍然没有排名、不进队列
+    import ast
+    src = (TECH_DIR / "score.py").read_text("utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "rank_day")
+    body = ast.get_source_segment(src, fn) or ""
+    assert "r.passed_gate and r.score is not None" in body, \
+        "排名的入选条件里没有 passed_gate —— 分档就变成闸门了"
+    assert "band" not in body.split("passed = ")[1][:200], \
+        "band 参与了入选判断"
+
+
+def t_score_params_are_frozen_and_equal_weighted():
+    """**等权不是因为它最优，是因为没有任何东西可以用来定权重。**"""
+    from cio.technical import score as sc
+    assert sc.params_fingerprint() == sc.FROZEN_FINGERPRINT, (
+        f"家族/成员/方向变了（{sc.params_fingerprint()}），"
+        f"请同时升 SCORE_VERSION（现在 {sc.SCORE_VERSION}）")
+    assert sc.SCORE_VERSION.startswith("score-2."), sc.SCORE_VERSION
+    src = (TECH_DIR / "score.py").read_text("utf-8")
+    assert "没有任何东西可以用来定权重" in src, "没写清楚为什么等权"
+    assert "不许用来定权重" in src, "没写明回测结果不能用来定权重"
+    import ast
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Assign) and any(
+                "weight" in getattr(t, "id", "").lower() for t in node.targets):
+            raise AssertionError("出现了权重参数 —— 那是一个没有依据的自由度")
+
+
+def t_nr7_stays_out_of_the_score_and_says_why():
+    """**NR7 只代表收缩这一端，不许混进双边异常族。**
+
+    她复核时提的：族里其他成员是"离典型状态多远"（双边），
+    NR7 是单边证据。加进去整族会天然偏向 compression——**混了方向，
+    而且从分数上完全看不出来混了。**
+
+    要用它就得先拆成 compression / expansion 两个单边量。v1 不做，
+    所以它继续显示在卡片上、不进分。这条必须写死，否则下一个人
+    "顺手补全一下波动族"就把它加回来了，而且不会有任何东西拦住。
+    """
+    from cio.technical import score as sc
+    assert any(b == "volatility" and f == "is_nr7"
+               for b, f, _ in sc.EXCLUDED_FROM_SCORE), "排除名单里没有 NR7"
+    for block, fld, why in sc.EXCLUDED_FROM_SCORE:
+        assert len(why) > 30, f"{block}.{fld} 排除了但没写理由"
+        # 排除名单里的字段不许出现在任何一个族里
+        for fam in sc.FAMILIES:
+            for m in fam.members:
+                assert not (m.block == block and m.field == fld), \
+                    f"{block}.{fld} 被排除了，却出现在 {fam.name} 族里"
+    # 它必须仍然在卡片上（排除的是"进分"，不是"不测量"）
+    card = ob.observe(zigzag(300), symbol="NR")
+    assert "is_nr7" in card.volatility, "NR7 从卡片上消失了 —— 那不是排除，是删掉了"
+    # 族名必须自带 extremeness，否则 0.9 会被读成"高波动是利好"
+    names = [f.name for f in sc.FAMILIES]
+    assert "volatility_extremeness" in names, names
+    assert not any(n in names for n in ("volatility_strength", "volatility_quality"))
+
+
+def t_coverage_travels_with_the_score():
+    """**2/5 族的 0.82 和 5/5 族的 0.78 不是同质的数。**
+
+    缺的族不进总分、剩下的重新等权是对的，但只做到这里，两个分数会
+    印在同一列里被横着比。所以覆盖度和分数**必须同框**，而且低于下限时
+    **不报分**——信息不够时的正确输出是"说不出"，不是一个漂亮的高分。
+    """
+    from cio.technical import score as sc
+    cards = [ob.observe(zigzag(300, drift=0.02 * (i + 1)), symbol=f"C{i}")
+             for i in range(5)]
+    ranked = sc.rank_day(cards)
+    poss = len([f for f in sc.FAMILIES if f.in_score])
+    for r in ranked:
+        assert r.families_possible == poss
+        got = [f.name for f in sc.FAMILIES
+               if f.in_score and r.families.get(f.name) is not None]
+        assert r.families_used == len(got), (r.families_used, got)
+        assert r.coverage == round(len(got) / poss, 4)
+        if r.families_used < sc.MIN_FAMILIES:
+            assert r.score is None, "覆盖度不足却报了分"
+            assert r.no_score_reason, "没有分数，却说不出为什么"
+            assert r.rank is None, "没有分数却排了名"
+        else:
+            assert r.score is not None
+
+    # **不是构造出来的极端情形——上市不满一年的票天生就是这样。**
+    # 252 日分位算不出来 → structure / volatility / relative_strength 三族全缺，
+    # 只剩 2 族。这种票**不该拿到一个自信的分数**。
+    short = [ob.observe(trending_up(40, step=0.05 * (i + 1)), symbol=f"NEW{i}")
+             for i in range(4)]
+    rs = sc.rank_day(short)
+    assert all(r.families_used < sc.MIN_FAMILIES for r in rs), \
+        [r.families_used for r in rs]
+    assert all(r.score is None for r in rs), "历史不足一年却报了分"
+    assert all("低于下限" in r.no_score_reason for r in rs), \
+        [r.no_score_reason for r in rs]
+    assert all(r.rank is None for r in rs)
+
+    # **一族都算不出来的极端**（取数回来是空面板就是这样）：也必须是 None。
+    # 这一支在任何正常夹具下都是死代码，所以要单独造出来走一遍——
+    # **走不到的分支，等于没有被任何断言保护。**
+    blank = ob.observe(zigzag(300), symbol="BLANK")
+    for blk in ("price_structure", "volume", "relative_strength", "volatility"):
+        setattr(blank, blk, {})
+    rb = sc.rank_day([blank])[0]
+    assert rb.families_used == 0, rb.families_used
+    assert rb.score is None, "一族都没有还给了分"
+    assert rb.no_score_reason, "没有分数却说不出为什么"
+
+    # **没有分数 ⟺ 说得出为什么。** 这条不依赖任何夹具凑出特定覆盖度：
+    # 它同时拦住"折成 0 分"（有分却带理由）和"静默变 None"（没分却没理由）。
+    for r in list(ranked) + list(rs) + [rb]:
+        assert (r.score is None) == bool(r.no_score_reason), \
+            f"{r.symbol}: score={r.score} reason={r.no_score_reason!r}"
+
+    # 覆盖度必须**印在给人看的出口上**，不只是存在字段里。
+    # 直接构造 Ranked 来断言——**不要写成 `if scored is not None:`**，
+    # 那样夹具没造出通过闸门的票时，这条断言就白写了。
+    synth = sc.Ranked(symbol="COV", as_of="2026-09-05", passed_gate=True,
+                      score=0.82, band="REVIEW", families={"structure": 0.8},
+                      families_used=2, families_possible=5, coverage=0.4, rank=1,
+                      within_budget=True)
+    text = "\n".join(sc.describe(synth))
+    assert "覆盖度" in text and "2/5" in text, \
+        "描述里没印覆盖度 —— 人就会横着比不同覆盖度的分数\n" + text
+    assert "族" in sc.today_line([synth]), sc.today_line([synth])
+    # **超预算 ≠ 没分数。** 合成一个数就说不清"没进队列"是今天太忙，
+    # 还是这只票的信息本来就不够。
+    thin_hit = sc.Ranked(symbol="THIN", passed_gate=True, score=None,
+                         families_used=2, families_possible=5,
+                         no_score_reason="覆盖度 2/5 低于下限 3/5")
+    line = sc.today_line([synth, thin_hit])
+    assert "超出今日注意力预算" not in line, "没分数的票被算成了超预算\n" + line
+    assert "覆盖度不足" in line and "THIN" in line, line
+    # 没有分数的那条也要说得出话，且不能被印成"分数很低"
+    nos = sc.Ranked(symbol="THIN", as_of="2026-09-05", passed_gate=True,
+                    score=None, families_used=2, families_possible=5,
+                    coverage=0.4, no_score_reason="覆盖度 2/5 低于下限 3/5")
+    t2 = "\n".join(sc.describe(nos))
+    assert "没有分数" in t2 and "覆盖度 2/5" in t2, t2
+    assert "0.0" not in t2, "没有分数被印成了 0 分"
+
+
+def t_market_wide_null_is_not_a_per_name_gap():
+    """**同一个事实重复 502 次，不会自己变成一个结论。**
+
+    2026-09-04 的真实情形：SPY 面板对齐后只剩 20–63 天，于是全市场
+    每一只票的 `excess_mkt_63` 同时变 null，而板块超额完全正常。
+    系统当时的表现是——在 502 张卡片上各写一句"该字段是 null"，
+    没有一处说"这一路基准坏了"。
+
+    **每个 null 都有原因**解决的是"这一格为什么空"；
+    它解决不了"这一整列为什么空"。
+    """
+    import pandas as pd
+    from cio.technical import sweep
+    n = 320
+    d = pd.bdate_range(start="2024-01-01", periods=n)
+    sector = pd.DataFrame({"date": d, "close": [100 * (1.0003 ** i) for i in range(n)]})
+    spy_short = pd.DataFrame({"date": d[-40:],
+                              "close": [100 * (1.0002 ** i) for i in range(40)]})
+    cards = [ob.observe(zigzag(n, drift=0.02 * (k + 1)), bench=spy_short,
+                        sector_bench=sector, symbol=f"S{k}", sector_symbol="XLK")
+             for k in range(8)]
+    # 前提：这正是她那天遇到的形状 —— 大盘超额全空、板块超额全有
+    assert all(c.relative_strength.get("excess_mkt_63") is None for c in cards)
+    assert all(c.relative_strength.get("excess_sector_63") is not None for c in cards)
+
+    asym = sweep.benchmark_asymmetry(cards)
+    fields = [a for a, _, _, _ in asym]
+    assert "excess_mkt_63" in fields, f"没认出大盘基准坏了：{asym}"
+    text = "\n".join(sweep.report(cards))
+    assert "一路基准坏了" in text, text
+    assert "excess_mkt_63" in text and "excess_sector_63" in text, text
+
+    # **不对称判据不靠阈值：两个基准都好的时候不许报警。**
+    ok = [ob.observe(zigzag(n, drift=0.02 * (k + 1)), bench=sector,
+                     sector_bench=sector, symbol=f"OK{k}", sector_symbol="XLK")
+          for k in range(8)]
+    assert not sweep.benchmark_asymmetry(ok), sweep.benchmark_asymmetry(ok)
+    assert "两个基准都正常" in "\n".join(sweep.report(ok))
+
+    # 扫描只数不改（和 panel_health 一样）
+    before = [dict(c.relative_strength) for c in cards]
+    sweep.report(cards)
+    assert [dict(c.relative_strength) for c in cards] == before, "扫描改了卡片"
+
+    # **扫出来没人看 = 没扫。** 快照必须真的调它。
+    src = (Path(__file__).resolve().parent / "technical_snapshot.py"
+           ).read_text("utf-8")
+    assert "sweep.report(" in src, "快照没有调用全市场扫描 —— 那就等于没做"
+
+
+def t_coverage_shows_families_and_items():
+    """**5/5 族不等于信息齐全。** 一族只要有一个成员算得出来就算"这一族有"。
+
+    她那两张卡片写着"覆盖度 5/5（100%）"，三行之后又写着
+    "缺：relative_strength 少了 excess_mkt_63"——**卡片自己打自己的脸。**
+    """
+    from cio.technical import score as sc
+    r = sc.Ranked(symbol="BBY", passed_gate=True, score=0.8554, band="HIGH",
+                  rank=1, within_budget=True, families_used=5, families_possible=5,
+                  coverage=1.0, families={f.name: 0.8 for f in sc.FAMILIES},
+                  missing={"relative_strength": ["excess_mkt_63"]})
+    text = "\n".join(sc.describe(r))
+    mtot = sum(len(f.members) for f in sc.FAMILIES)
+    assert f"{mtot - 1}/{mtot} 项" in text, text
+    assert "5/5 族" in text, text
+    assert "100%" not in text, "缺着成员还印 100% —— 那正是要修的那句\n" + text
+
+
+def t_short_benchmark_is_reported_not_swallowed():
+    """**"取到了"和"取全了"是两回事。**
+
+    30 行的 SPY 面板照样通过 `len(df)`，然后让全市场的大盘超额同时变 null。
+    """
+    import ast
+    src = (Path(__file__).resolve().parents[1] / "src" / "cio"
+           / "quant_data.py").read_text("utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "get_benchmark")
+    body = ast.get_source_segment(src, fn) or ""
+    assert "benchmark_rows" in body, "基准没记行数 —— 短了看不出来"
+    assert "benchmark_short" in body, "基准短了没有任何提示"
+    cmps = [n for n in ast.walk(fn) if isinstance(n, ast.Compare)]
+    assert any("days" in ast.dump(c) and "len" in ast.dump(c) for c in cmps), \
+        "只记了行数却没和请求的天数比 —— 那个数不会自己变成告警"
+
+    # **AST 只能证明那行代码在，不能证明它说的是实话。** 真调一遍：
+    # 换掉取数函数（不联网），喂 40 行，看它报的是不是 40。
+    import pandas as pd
+    from cio import quant_data as qd
+    real, real_mkt = qd._yf_hist, qd.MARKET
+    try:
+        qd.MARKET = "us"
+        d = pd.bdate_range(start="2024-01-01", periods=40)
+        qd._yf_hist = lambda sym, days: pd.DataFrame(
+            {"date": d, "open": [1.0] * 40, "high": [1.0] * 40,
+             "low": [1.0] * 40, "close": [1.0] * 40, "volume": [1.0] * 40})
+        st: dict = {}
+        out = qd.get_benchmark(days=400, status=st)
+        assert out is not None and len(out) == 40
+        assert st.get("benchmark_rows") == 40, \
+            f"报的行数不是真实行数：{st.get('benchmark_rows')}"
+        assert st.get("benchmark_want") == 400, st.get("benchmark_want")
+        assert st.get("benchmark_short"), "只取到 40/400 行却没有任何提示"
+
+        # 取全了就不该报警，否则这盏灯常亮，等于没有
+        full = pd.bdate_range(start="2024-01-01", periods=400)
+        qd._yf_hist = lambda sym, days: pd.DataFrame(
+            {"date": full, "open": [1.0] * 400, "high": [1.0] * 400,
+             "low": [1.0] * 400, "close": [1.0] * 400, "volume": [1.0] * 400})
+        st2: dict = {}
+        qd.get_benchmark(days=400, status=st2)
+        assert st2.get("benchmark_rows") == 400, st2.get("benchmark_rows")
+        assert not st2.get("benchmark_short"), "取全了还报警 —— 常亮的灯没有用"
+    finally:
+        qd._yf_hist, qd.MARKET = real, real_mkt
+
+
+def t_one_nan_in_the_benchmark_does_not_erase_the_whole_market():
+    """**502 张卡片、大盘超额全空、板块超额全好。** 真实发生过（2026-09-04）。
+
+    原因是 SPY 最后一根收盘是 NaN（yfinance 尾行常见）。
+    `_ret()` 写的是 `series[-n-1] <= 0`——防了分母 ≤0，**没防 NaN**，
+    而 `NaN <= 0` 是 `False`，一路放行返回 NaN，下游 `scrub()` 收成
+    null 加一句原因，看起来像"处理过了"。
+
+    形状本身就是指纹：**三个窗口一起空**，因为分子是同一个 `series[-1]`；
+    斜率那一支照算，因为它的推导式里 `NaN > 0` 是 False、顺手滤掉了。
+
+    我第一次诊断成"SPY 面板取短了"，是被 `rs_mkt_samples=405` 骗的——
+    那个数当时数的是"对齐了几天"，不是"几天能用"。**两个都修。**
+    """
+    import pandas as pd
+    from cio.technical import relative_strength as rsm
+    n = 405
+    d = pd.bdate_range(start="2024-01-01", periods=n)
+    stock = pd.DataFrame({"date": d, "close": [100 * (1.0004 ** i) for i in range(n)]})
+    sector = pd.DataFrame({"date": d, "close": [100 * (1.0003 ** i) for i in range(n)]})
+    spy = [100 * (1.0002 ** i) for i in range(n)]
+    spy[-1] = float("nan")                       # **只有最后一根**
+    bench = pd.DataFrame({"date": d, "close": spy})
+
+    v, _ = rsm.measure(stock, bench=bench, sector_bench=sector, sector_symbol="XLK")
+    for w in rsm.EXCESS_WINDOWS:
+        assert v[f"excess_mkt_{w}"] is not None, \
+            f"一根 NaN 就把 excess_mkt_{w} 抹掉了（全市场同时发生）"
+        assert v[f"excess_sector_{w}"] is not None
+    # 样本数说的必须是**可用天数**，不是对齐天数
+    assert v["rs_mkt_samples"] == n - 1, \
+        f"样本数把 NaN 也数进去了：{v['rs_mkt_samples']} —— 那是个安慰量，不是诊断量"
+    assert v["rs_sector_samples"] == n
+
+    # 端点是 NaN 的直接单测（`NaN <= 0` 为 False，老实现会返回 NaN）
+    good = [float(i + 1) for i in range(30)]
+    assert rsm._ret(good, 21) is not None
+    nan_last = good[:-1] + [float("nan")]
+    assert rsm._ret(nan_last, 21) is None, "分子是 NaN 却算出了收益率"
+    nan_base = list(good)
+    nan_base[-22] = float("nan")
+    assert rsm._ret(nan_base, 21) is None, "分母是 NaN 却算出了收益率"
+    assert rsm._ret([0.0] + good, 30) is None, "分母 ≤0 的老保护不能丢"
+
+    # **个股侧的 NaN 也要丢。** 只防基准侧，个股停牌那天照样把 NaN 收进来。
+    bad_stock = [100 * (1.0004 ** i) for i in range(n)]
+    bad_stock[-1] = float("nan")
+    v2, _ = rsm.measure(pd.DataFrame({"date": d, "close": bad_stock}),
+                        bench=pd.DataFrame({"date": d,
+                                            "close": [100 * (1.0002 ** i)
+                                                      for i in range(n)]}),
+                        sector_bench=sector, sector_symbol="XLK")
+    assert v2["rs_mkt_samples"] == n - 1, \
+        f"个股侧的 NaN 被当成样本了：{v2['rs_mkt_samples']}"
+    for w in rsm.EXCESS_WINDOWS:
+        assert v2[f"excess_mkt_{w}"] is not None, "个股侧一根 NaN 就抹掉了超额"
+
+    # 原因不许说错。长度够、只是端点不可用时，不能写成"样本不足"
+    short_bench = pd.DataFrame({"date": d[-10:], "close": [100.0] * 10})
+    _, w2 = rsm.measure(stock, bench=short_bench, sector_bench=sector,
+                        sector_symbol="XLK")
+    why = " ".join(str(x) for x in w2.values())
+    assert why, "全都算不出来却一句原因都没有"
+
+    # **取数那层要把"最后一根坏"和"中间有几根坏"说成两件事**——
+    # 只断言"有一句提示"是不够的：说错话的实现也有一句提示。
+    from cio import quant_data as qd
+    real, real_mkt = qd._yf_hist, qd.MARKET
+
+    def _bench_status(nan_at):
+        cl = [1.0] * 400
+        cl[nan_at] = float("nan")
+        qd._yf_hist = lambda sym, days: pd.DataFrame(
+            {"date": pd.bdate_range(start="2024-01-01", periods=400),
+             "open": [1.0] * 400, "high": [1.0] * 400, "low": [1.0] * 400,
+             "close": cl, "volume": [1.0] * 400})
+        st: dict = {}
+        qd.get_benchmark(days=400, status=st)
+        return st
+
+    try:
+        qd.MARKET = "us"
+        last = _bench_status(-1)
+        mid = _bench_status(100)
+        assert last.get("benchmark_last_bad") is True
+        assert mid.get("benchmark_last_bad") is False
+        assert last.get("benchmark_last_note") != mid.get("benchmark_last_note"), \
+            "最后一根坏和中间坏说的是同一句话 —— 那句话就没有信息"
+        assert "最后一根" in str(last.get("benchmark_last_note")), \
+            last.get("benchmark_last_note")
+        assert not last.get("benchmark_short"), "400 行不短，不该报短"
+    finally:
+        qd._yf_hist, qd.MARKET = real, real_mkt
+
+    # 报了没人印 = 没报
+    snap = (Path(__file__).resolve().parent / "technical_snapshot.py"
+            ).read_text("utf-8")
+    assert "benchmark_last_note" in snap, "基准的 NaN 提示没有印出来"
+
+
+def t_a_lamp_that_is_always_on_is_the_same_defect_as_one_that_never_lights():
+    """**修完之后的警告必须说"现在是什么"，不是"修之前会怎样"。**
+
+    build114 第一版印的是：
+
+        成对基准对称，两个基准都正常                      ← 判据说没事
+        **基准最后一根收盘是 NaN** —— 会让全市场的大盘超额同时变 null  ← 警告说要出事
+
+    第二句在修完之后是**假的**：那根 NaN 会被 `align()` 丢掉，超额照算。
+    而 yfinance 的未落定尾行**每天都有**——于是这盏灯天天亮，
+    报一个不会发生的故障。**常亮的灯和不亮的灯是同一种缺陷。**
+
+    同时钉住那个真实的代价：两个基准的截止日会差一天，而这件事
+    **必须出现在卡片上**，不能只活在我脑子里。
+    """
+    import pandas as pd
+    from cio.technical import observer as tob
+    from cio.technical import sweep
+    from cio import quant_data as qd
+
+    n = 405
+    d = pd.bdate_range(start="2024-01-01", periods=n)
+    spy = [100 * (1.0002 ** i) for i in range(n)]
+    spy[-1] = float("nan")
+    bench = pd.DataFrame({"date": d, "close": spy})
+    sector = pd.DataFrame({"date": d, "close": [100 * (1.0003 ** i) for i in range(n)]})
+    base = [100 + 0.05 * i for i in range(n)]
+    panel = pd.DataFrame({"date": d, "open": base, "high": [x + 0.6 for x in base],
+                          "low": [x - 0.6 for x in base], "close": base,
+                          "volume": [1e6 + 2e5 * (i % 9) for i in range(n)]})
+    cards = [tob.observe(panel, bench=bench, sector_bench=sector,
+                         symbol=f"S{k}", sector_symbol="XLK") for k in range(4)]
+
+    # 一、超额照算（说明警告里那句"会变 null"确实不成立了）
+    for c in cards:
+        assert c.relative_strength.get("excess_mkt_63") is not None
+
+    # 二、截止日差一天，而且**写在卡片上**
+    m = cards[0].relative_strength.get("rs_mkt_as_of")
+    s = cards[0].relative_strength.get("rs_sector_as_of")
+    assert m and s and m != s, (m, s)
+    assert m < s, "被丢掉的应该是大盘那一路的最后一天"
+
+    # 三、扫描要把这件事说出来
+    text = "\n".join(sweep.report(cards))
+    assert "截止日不一样" in text and m in text and s in text, text
+
+    # 四、**警告的措辞**：不许再声称会让超额变 null
+    real, real_mkt = qd._yf_hist, qd.MARKET
+    try:
+        qd.MARKET = "us"
+        cl = [1.0] * 400
+        cl[-1] = float("nan")
+        qd._yf_hist = lambda sym, days: pd.DataFrame(
+            {"date": pd.bdate_range(start="2024-01-01", periods=400),
+             "open": [1.0] * 400, "high": [1.0] * 400, "low": [1.0] * 400,
+             "close": cl, "volume": [1.0] * 400})
+        st: dict = {}
+        qd.get_benchmark(days=400, status=st)
+        note = str(st.get("benchmark_last_note") or "")
+        assert note, "尾行 NaN 一句话都不说也不行 —— 它确实有代价"
+        assert "变 null" not in note and "同时变" not in note, \
+            "警告还在声称一个修完之后不会发生的后果：\n" + note
+        assert "丢掉" in note, "没说清楚它被怎么处理了：\n" + note
+    finally:
+        qd._yf_hist, qd.MARKET = real, real_mkt
+
+    # 五、行数措辞：拿到比要的多不是错（_yf_period 走的是 2y/5y 档）
+    snap = (Path(__file__).resolve().parent / "technical_snapshot.py"
+            ).read_text("utf-8")
+    assert "至少要" in snap, "「要 400 行」会让 1255 看起来像出错"
+
+
+def t_changing_what_a_field_means_must_move_the_schema_version():
+    """**我在自己新加的代码上违反了自己定的血统纪律。**
+
+    build114 改了 `align()`，于是 `rs_mkt_samples` 同一份输入给出不同的数
+    （405 → 404），而这个数说的东西也变了：从"对齐了几天"变成"几天能用"。
+    **那是语义变了。** 卡片模块开头写着"改字段含义必须升版本"——我没升。
+
+    后果很具体：她的 `2026-09-04.jsonl` 被三个版本的代码各写过一遍，
+    三次都盖 `signal-card-1.0.0` 的章，`version_drift()` 会报告"全是同一版"。
+    **内容不同，图章相同**，正是 build109/110 那条纪律要防的事。
+
+    语义变了没法自动检测，但**字段集变了可以**——所以有一条字段名指纹。
+    """
+    from cio.technical import SCHEMA_VERSION
+
+    assert SCHEMA_VERSION == "signal-card-1.1.0", SCHEMA_VERSION
+    src = (TECH_DIR / "__init__.py").read_text("utf-8")
+    assert "1.0.0 → 1.1.0" in src, "升了版本却没写清楚为什么，以后没人知道两版差在哪"
+    assert "rs_mkt_samples" in src, "没写明是哪个字段的语义变了"
+
+    # 指纹必须只跟字段名走，**不跟具体这张卡片算出了什么走**
+    fps = set()
+    for n, wb in ((405, True), (300, True), (60, False)):
+        d = pd.bdate_range(start="2024-01-01", periods=n)
+        c = [100 + 0.05 * i for i in range(n)]
+        b = (pd.DataFrame({"date": d, "close": [100 * (1.0002 ** i) for i in range(n)]})
+             if wb else None)
+        card = ob.observe(pd.DataFrame({
+            "date": d, "open": c, "high": [x + 0.5 for x in c],
+            "low": [x - 0.5 for x in c], "close": c,
+            "volume": [1e6 + 3e5 * (i % 7) for i in range(n)]}),
+            bench=b, sector_bench=b, symbol="F",
+            sector_symbol="XLK" if wb else "")
+        fps.add(ob.card_fields_fingerprint(card))
+    assert len(fps) == 1, f"指纹跟着数据变了，那它每天都红，等于没有：{fps}"
+    assert fps.pop() == ob.FROZEN_FIELDS_FINGERPRINT, (
+        "卡片字段集变了 —— 先回答：这次是加字段（可以不升版本），"
+        "还是改语义（必须升 SCHEMA_VERSION）？")
+
+    # 新加的两个字段确实在契约里
+    d = pd.bdate_range(start="2024-01-01", periods=405)
+    c = [100 + 0.05 * i for i in range(405)]
+    b = pd.DataFrame({"date": d, "close": [100 * (1.0002 ** i) for i in range(405)]})
+    card = ob.observe(pd.DataFrame({
+        "date": d, "open": c, "high": [x + 0.5 for x in c],
+        "low": [x - 0.5 for x in c], "close": c, "volume": [1e6] * 405}),
+        bench=b, sector_bench=b, symbol="F", sector_symbol="XLK")
+    for f in ("rs_mkt_as_of", "rs_sector_as_of", "rs_mkt_samples"):
+        assert f in card.relative_strength, f
+
+
+def t_the_review_ledger_is_not_a_trading_day():
+    """**复核台账被当成了一个交易日。** 她跑一条诊断命令时掉出来的：
+
+        已存日期 ['2026-09-01', '2026-09-04', 'reviews']
+
+    `reviews.jsonl` 和卡片存在同一个目录，而 `dates()` 是 `glob("*.jsonl")`
+    取文件名。`events()` / `version_drift()` / `hit_series()` 全都遍历
+    `dates()`——**台账的行一直在被当作信号卡片读。**
+
+    今天没出事，只因为台账的行里没有 `symbol`、恰好被跳过。
+    **"恰好没出事"和"不会出事"是两回事。**
+
+    修两条，只修一条都不够：台账搬出卡片目录（不再有可污染的东西）；
+    `dates()` 只认日期形状（万一又有人往里放东西）。
+    """
+    import tempfile
+    from cio.technical import review, store
+    with tempfile.TemporaryDirectory() as td:
+        card_dir = Path(td) / "technical_cards"
+        card_dir.mkdir(parents=True)
+        old_card, old_rev = store.CARD_DIR, review.REVIEW_PATH
+        old_legacy = review.LEGACY_REVIEW_PATH
+        try:
+            store.CARD_DIR = card_dir
+            review.REVIEW_PATH = Path(td) / "technical_reviews" / "reviews.jsonl"
+            review.LEGACY_REVIEW_PATH = card_dir / "reviews.jsonl"
+
+            # 一、台账不许再落进卡片目录
+            assert review.REVIEW_PATH.parent != store.CARD_DIR, \
+                "台账还在卡片目录里 —— 污染源没有搬走"
+
+            # 二、就算有人往卡片目录里放东西，也不许被当成交易日
+            (card_dir / "2026-09-04.jsonl").write_text(
+                '{"symbol":"AAA","setup":{"hit":true},"stamps":{}}\n', "utf-8")
+            (card_dir / "reviews.jsonl").write_text(
+                '{"as_of":"2026-09-04","symbol":"AAA","verdict":"worth"}\n', "utf-8")
+            (card_dir / "backup-2026.jsonl").write_text("{}\n", "utf-8")
+            got = store.dates()
+            assert got == ["2026-09-04"], f"非日期文件被当成交易日了：{got}"
+            assert "reviews" not in got and "backup-2026" not in got
+            # 形状检查必须是**日期形状**，不是"含个数字就行"：
+            # `backup-2026` 里有数字，放松了它就又混进来了
+            for junk in ("backup-2026", "2026-09", "20260904", "2026-9-4",
+                         "2026-09-04-old"):
+                (card_dir / f"{junk}.jsonl").write_text("{}\n", "utf-8")
+            assert store.dates() == ["2026-09-04"], \
+                f"形状检查太松，混进来了：{store.dates()}"
+            for junk in ("backup-2026", "2026-09", "20260904", "2026-9-4",
+                         "2026-09-04-old"):
+                (card_dir / f"{junk}.jsonl").unlink()
+
+            # **跳过了什么要说出来**，否则又是一次静默过滤
+            (card_dir / "stray.jsonl").write_text("{}\n", "utf-8")
+            import logging
+            seen = []
+
+            class _Grab(logging.Handler):
+                def emit(self, rec):
+                    seen.append(rec.getMessage())
+
+            h = _Grab()
+            store.log.addHandler(h)
+            try:
+                store.dates()
+            finally:
+                store.log.removeHandler(h)
+            assert any("stray" in m for m in seen), \
+                f"跳过了非日期文件却一声不吭 —— 静默过滤又来了：{seen}"
+            (card_dir / "stray.jsonl").unlink()
+
+            # 三、旧位置的台账要搬过去，而且**不双写**
+            review.LEGACY_REVIEW_PATH.write_text(
+                '{"as_of":"2026-09-01","symbol":"BBB","verdict":"skip"}\n', "utf-8")
+            note = review.migrate_if_needed()
+            assert note and "搬出" in note, note
+            assert review.REVIEW_PATH.exists(), "没搬过去"
+            assert not review.LEGACY_REVIEW_PATH.exists(), \
+                "旧文件还在 —— 两个地方各一份，迟早对不上"
+            assert (card_dir / "reviews.jsonl.moved").exists(), \
+                "旧文件被删了 —— 应该是改名让位，不是删除"
+            rows = review._load()
+            assert any(r.get("symbol") == "BBB" for r in rows), "搬过去把内容弄丢了"
+            # 搬完之后卡片目录里只剩真正的一天
+            assert store.dates() == ["2026-09-04"], store.dates()
+        finally:
+            store.CARD_DIR = old_card
+            review.REVIEW_PATH, review.LEGACY_REVIEW_PATH = old_rev, old_legacy
+
+
+def t_backtest_can_never_feed_back_into_the_definition():
+    """**看完收益不许回头调阈值。** 这条写成 import 约束，不是写成承诺。
+
+    `score.py` 和 `setups.py` 都不许 import `backtest` —— 一旦能 import，
+    "根据回测结果调一下"就只差一行代码，而那一行不会有任何东西拦住。
+    """
+    import ast
+    for name in ("score.py", "setups.py"):
+        tree = ast.parse((TECH_DIR / name).read_text("utf-8"))
+        for n in ast.walk(tree):
+            mods = []
+            if isinstance(n, ast.ImportFrom):
+                mods = [n.module or ""] + [a.name for a in n.names]
+            elif isinstance(n, ast.Import):
+                mods = [a.name for a in n.names]
+            assert not any("backtest" in str(m) for m in mods), \
+                f"{name} import 了 backtest —— 定义层不许看见结果层"
+
+
+def t_controls_are_not_matched_on_the_setup_itself():
+    """**对照组不能匹配 setup 自己的成分。**
+
+    匹配掉"距上方价区的距离"和"放量天数"，剩下的差异必然接近零，
+    而那个零什么都不说明。匹配的应当是混淆项：同日、同板块、相近波动。
+    """
+    import ast
+    src = (TECH_DIR / "backtest.py").read_text("utf-8")
+    fn = next(n for n in ast.walk(ast.parse(src))
+              if isinstance(n, ast.FunctionDef) and n.name == "pick_controls")
+    body = ast.get_source_segment(src, fn) or ""
+    for banned in ("atr_to_nearest_zone_above", "days_rvol_over_1_5_of_20", "cmf_20"):
+        assert banned not in body, f"对照组匹配用到了 setup 的成分 {banned}"
+    assert "atr_percentile_252" in body and "sectors" in body, "没有匹配混淆项"
+    # 通过闸门的票不能当对照
+    assert 'evaluate(c)["hit"]' in body, "对照池里可能混进了同样命中的票"
+
+
+def t_backtest_says_what_it_cannot_claim():
+    """**报告必须先说这份结果不能声称什么。**
+
+    一份不带前提的回测数字，读者只会记住那个百分比。
+    """
+    from cio.technical import backtest as bt
+    surv = {"universe": 10, "n_late": 1, "late_entrants": [("X", "2026-01-01")],
+            "note": "n"}
+    rep = {"events": [], "n_events": 0, "n_event_days": 0,
+           "day_diff": {h: [] for h in bt.HORIZONS}, "setup_id": "S",
+           "setup_version": "v", "horizons": list(bt.HORIZONS)}
+    text = "\n".join(bt.summarize(rep, surv))
+    for must in ("不是样本外检验", "幸存者偏差", "不许回头调阈值"):
+        assert must in text, f"报告里少了「{must}」"
+    assert "估不出任何东西" in text, "样本量不足时没有明说"
+
+
 TESTS = [
     ("**字段名与输出字符串里没有禁用词**", t_no_banned_words),
     ("**跑出来的卡片上也没有禁用词**", t_the_card_itself_carries_no_judgement),
@@ -837,6 +1794,30 @@ TESTS = [
     ("**PIT 按区间判，不是全局布尔**", t_universe_pit_is_judged_per_window),
     ("**事件带完整血统（含价区算法版本）**", t_event_carries_full_lineage_not_just_setup_version),
     ("**卡片保留自己当时的版本号**", t_stored_cards_keep_their_own_versions),
+    ("**NaN 是第三种状态（不是 None，也不是数）**", t_nan_is_the_third_state),
+    ("**面板体检只数不修**", t_panel_health_counts_but_does_not_repair),
+    ("兜底 scrub 是穷举的（含嵌套）", t_scrub_is_exhaustive_including_nested),
+    ("**阈值没变但版本变了**", t_setup_version_moved_even_though_thresholds_did_not),
+    ("**v2：闸门决定有没有，家族分决定先看谁**", t_v2_gate_decides_whether_rank_decides_who),
+    ("**加指标不改变这一族的权重**", t_adding_an_indicator_does_not_change_its_family_weight),
+    ("方向正确，且波动族无方向", t_directions_and_the_one_judgement_call),
+    ("缺的成员不补 0 也不补 0.5", t_missing_member_is_dropped_not_filled),
+    ("**分档是标签，不是闸门**", t_bands_are_labels_not_a_gate),
+    ("**家族等权且结构冻结**", t_score_params_are_frozen_and_equal_weighted),
+    ("**NR7 不进分（单边证据不混进双边异常族）**", t_nr7_stays_out_of_the_score_and_says_why),
+    ("**覆盖度和分数同框；不够就不报分**", t_coverage_travels_with_the_score),
+    ("**5/5 族 ≠ 信息齐全（族覆盖度和项覆盖度都要印）**", t_coverage_shows_families_and_items),
+    ("**全市场缺 ≠ 个别票缺（成对基准不对称）**", t_market_wide_null_is_not_a_per_name_gap),
+    ("**基准取短了要报出来，不是吞掉**", t_short_benchmark_is_reported_not_swallowed),
+    ("**基准一根 NaN 抹掉全市场大盘超额**", t_one_nan_in_the_benchmark_does_not_erase_the_whole_market),
+    ("**常亮的灯 = 不亮的灯（警告要说现在，不说修之前）**",
+     t_a_lamp_that_is_always_on_is_the_same_defect_as_one_that_never_lights),
+    ("**改字段含义必须升 schema_version（我自己违反了）**",
+     t_changing_what_a_field_means_must_move_the_schema_version),
+    ("**复核台账不是一个交易日（目录污染）**", t_the_review_ledger_is_not_a_trading_day),
+    ("**回测结果不能回流到定义层**", t_backtest_can_never_feed_back_into_the_definition),
+    ("**对照组不匹配 setup 自己的成分**", t_controls_are_not_matched_on_the_setup_itself),
+    ("回测报告先说它不能声称什么", t_backtest_says_what_it_cannot_claim),
 ]
 
 print("=" * 72)

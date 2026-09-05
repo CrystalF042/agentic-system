@@ -80,8 +80,10 @@ def market_now(now: datetime | None = None) -> datetime:
     return (now or datetime.now(ZoneInfo("UTC"))).astimezone(market_tz())
 
 
-def window() -> tuple[time, time]:
-    return PREMARKET_WINDOW.get(MARKET, PREMARKET_WINDOW["cn"])
+def window(win: dict | None = None) -> tuple[time, time]:
+    """市场本地时间的窗口。默认盘前；传 `SNAPSHOT_WINDOW` 取收盘窗口。"""
+    w = win if win is not None else PREMARKET_WINDOW
+    return w.get(MARKET, w["cn"])
 
 
 def _in_window(win: dict, label: str, now: datetime | None) -> tuple[bool, str]:
@@ -122,17 +124,49 @@ def is_premarket(now: datetime | None = None) -> tuple[bool, str]:
                   f"{lo.strftime('%H:%M')}–{hi.strftime('%H:%M')} 内")
 
 
+def _tz(machine_tz):
+    """把时区参数变成 `ZoneInfo` 或 `None`。**参数错了要当场说清楚。**
+
+    原来这里是 `ZoneInfo(machine_tz) if machine_tz else None`，传错类型
+    （比如把 `PREMARKET_WINDOW` 这个 dict 传进来）会一路走到 `ZoneInfo`
+    内部才炸，抛出来的是：
+
+        TypeError: unhashable type: 'dict'
+
+    那句话说的是**症状发生的地方，不是错误发生的地方**：它只讲"dict 不能做
+    弱引用缓存的键"，没讲是谁把什么传错了。签名上写着 `str | None`，
+    但注解在运行时不做任何事。
+
+    这是这个项目一直在防的那类缺陷的小号版本——**报错必须指向原因。**
+    """
+    if machine_tz is None or machine_tz == "":
+        return None
+    if not isinstance(machine_tz, str):
+        raise TypeError(
+            f"machine_tz 要一个时区名字符串（如 'America/New_York'），"
+            f"收到的是 {type(machine_tz).__name__}：{machine_tz!r}")
+    try:
+        return ZoneInfo(machine_tz)
+    except Exception as e:                                     # noqa: BLE001
+        raise ValueError(
+            f"认不出这个时区名：{machine_tz!r}（{type(e).__name__}）。"
+            f"要的是 IANA 名字，比如 'America/New_York' / 'Asia/Shanghai'") from e
+
+
 def local_window(machine_tz: str | None = None,
-                 now: datetime | None = None) -> tuple[str, str]:
-    """把盘前窗口换算成**这台机器本地时间**，用来告诉人"你这儿是几点"。
+                 now: datetime | None = None,
+                 win: dict | None = None) -> tuple[str, str]:
+    """把窗口换算成**这台机器本地时间**，用来告诉人"你这儿是几点"。
+
+    默认是盘前窗口；传 `win=SNAPSHOT_WINDOW` 换算收盘窗口。
 
     换算随夏令时变化，所以它是一个查询函数，不是一个常量——
     把结果抄进 crontab 就又回到了原来那个坑。
     """
-    tz = ZoneInfo(machine_tz) if machine_tz else None
+    tz = _tz(machine_tz)
     base = (now or datetime.now(ZoneInfo("UTC")))
     m = base.astimezone(market_tz())
-    lo, hi = window()
+    lo, hi = window(win)
     out = []
     for t in (lo, hi):
         dt = m.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
@@ -154,8 +188,32 @@ def cron_hint(machine_tz: str | None = None, now: datetime | None = None) -> lis
         "  0 * * * 1-5  cd ~/.openclaw/workspace/cio-agent && "
         ".venv/bin/python run_premarket.py",
         "",
-        f"想少醒几次也行，但**一年两次夏令时切换要手动改**：0 {lo.split(':')[0]} * * 1-5",
+        _fixed_hour_note(machine_tz, lo),
     ]
+
+
+def _fixed_hour_note(machine_tz, lo: str) -> str:
+    """写死小时数到底要不要一年手动改两次，**取决于机器时区是不是市场时区**。
+
+    原来这里无条件写"一年两次夏令时切换要手动改"。在她那台美东的机器上
+    **那句话是假的**：本机 06:00 就是市场 06:00，launchd/cron 跟着本机 DST 走，
+    自己就对了。无条件印一句不成立的警告，和不印一样没用——
+    人学会忽略它之后，真正需要手动改的那天也会被忽略。
+    """
+    same = _tz(machine_tz) if machine_tz else None
+    try:
+        mine = (same or datetime.now().astimezone().tzinfo)
+        m = datetime.now(ZoneInfo("UTC"))
+        aligned = (m.astimezone(market_tz()).utcoffset()
+                   == m.astimezone(mine).utcoffset())
+    except Exception:                                          # noqa: BLE001
+        aligned = False
+    head = f"想少醒几次也行：0 {lo.split(':')[0]} * * 1-5"
+    if aligned:
+        return (head + "　——　这台机器就在市场时区，"
+                "**夏令时由系统自己跟，不用手动改**")
+    return (head + "　——　但机器时区和市场时区不同，"
+            "**一年两次夏令时切换要手动改**")
 
 
 def next_window_start(now: datetime | None = None) -> datetime:

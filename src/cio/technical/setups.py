@@ -55,10 +55,21 @@ import hashlib
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .numbers import finite
 from .price_structure import CLUSTER_ATR_MULT
 
 SETUP_ID = "SETUP_VOLUME_ACCUMULATION_AT_ZONE_V1"
-SETUP_VERSION = "setup-1.0.0"
+SETUP_VERSION = "setup-1.0.1"
+"""**1.0.0 → 1.0.1：三个阈值一个都没改，但行为变了。**
+
+1.0.0 下，面板里一根缺失的 K 线会让 `cmf_20` / `obv_slope_20` 变成 NaN，
+而 `NaN > 0.10` 静默返回 False —— 于是"算不出来"被记成了"不成立"，
+`unknown` 里还是空的。任何一只票只要有一根坏 K 线，就被无声地排除在命中之外。
+
+1.0.1 起 NaN 统一收成 `None`（见 `numbers.py`），走 `unknown` 那条路。
+**同一天同一只票，两个版本可能给出不同结果**，所以两版的事件不能混在一起统计
+——这正是血统四元组存在的理由。参数指纹不变（阈值确实没动），
+变的是 `SETUP_VERSION`。"""
 
 A_MIN_SPIKE_DAYS = 5
 B_MIN_CMF = 0.10
@@ -96,10 +107,12 @@ def evaluate(card) -> dict:
     整份 v1 都在防这件事。
     """
     v, ps = card.volume, card.price_structure
-    spike = v.get("days_rvol_over_1_5_of_20")
-    cmf = v.get("cmf_20")
-    obv = v.get("obv_slope_20")
-    dist = ps.get("atr_to_nearest_zone_above")
+    # **每一个都过 `finite()`。** 卡片理应已经洗过，但这一层是判定层——
+    # 它不该假设上游没漏。NaN 在这里静默判 False 的代价是一次看不见的漏判。
+    spike = finite(v.get("days_rvol_over_1_5_of_20"))
+    cmf = finite(v.get("cmf_20"))
+    obv = finite(v.get("obv_slope_20"))
+    dist = finite(ps.get("atr_to_nearest_zone_above"))
 
     unknown = [name for name, val in (("A_participation", spike),
                                       ("B_accumulation_proxy", cmf),

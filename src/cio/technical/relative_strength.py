@@ -30,6 +30,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+from .numbers import finite, scrub
+
 RS_SLOPE_N = 20
 EXCESS_WINDOWS = (21, 63, 126)
 RS_HIGH_N = 63
@@ -52,23 +54,59 @@ def _pairs(df):
 
 
 def align(df, bench) -> tuple[list, list]:
-    """按日期取交集。返回 (个股收盘序列, 基准收盘序列)，**等长且逐位同日**。"""
-    if df is None or bench is None or not len(df) or not len(bench):
-        return [], []
-    b = dict(_pairs(bench))
-    a_dates, a_close, b_close = [], [], []
-    for d, c in _pairs(df):
-        if d in b:
-            a_dates.append(d)
-            a_close.append(c)
-            b_close.append(b[d])
+    """按日期取交集。返回 (个股收盘序列, 基准收盘序列)，**等长且逐位同日**。
+
+    **非有限的配对整对丢掉。** 2026-09-04 真实发生过：SPY 最后一根收盘是
+    NaN（yfinance 尾行常见），而这里把它当成一个正常样本收下来，
+    于是 `rs_mkt_samples` 报 405——**那句话的意思变成了"对齐了 405 天"，
+    而不是"405 天能用"**。我自己就是被这个数误导，先诊断成了"基准取短了"。
+
+    样本数必须说的是**可用天数**，否则它不是一个诊断量，是一个安慰量。
+    """
+    a_close, b_close, _ = align_with_asof(df, bench)
     return a_close, b_close
 
 
+def align_with_asof(df, bench) -> tuple:
+    """同 `align()`，但**多返回最后一个可用日期**。
+
+    这个日期必须跟着数走：基准的尾行是 NaN 时，那一天整对被丢掉，
+    于是这一路的超额其实截止到 T-1。而另一个基准可能截止到 T——
+    **两个数印在同一族里、进同一个分数，as-of 却差一天，卡片上看不出来。**
+    """
+    if df is None or bench is None or not len(df) or not len(bench):
+        return [], [], None
+    b = dict(_pairs(bench))
+    a_close, b_close, last = [], [], None
+    for d, c in _pairs(df):
+        if d not in b:
+            continue
+        x, y = finite(c), finite(b[d])
+        if x is None or y is None:
+            continue                       # **NaN 不是一个样本**
+        a_close.append(x)
+        b_close.append(y)
+        last = d
+    return a_close, b_close, last
+
+
 def _ret(series: list, n: int) -> Optional[float]:
-    if len(series) < n + 1 or series[-n - 1] <= 0:
+    """`series[-1] / series[-n-1] - 1`。**两端都要是有限数。**
+
+    原来只写了 `series[-n-1] <= 0`——防住了分母 ≤0，**没防 NaN**，
+    而 `NaN <= 0` 是 `False`，于是一路放行、返回 NaN。
+    下游 `scrub()` 把 NaN 收成 null 加一句原因，看起来像"处理过了"：
+    没崩、有解释，**但全市场每一只票的大盘超额同时丢了，没有一处说这件事。**
+
+    分子是同一个 `series[-1]`，所以它一 NaN，21/63/126 三个窗口**一起**空——
+    这个形状本身就是指纹（build111：**NaN 是第三种状态**）。
+    """
+    if len(series) < n + 1:
         return None
-    return series[-1] / series[-n - 1] - 1.0
+    last, base = finite(series[-1]), finite(series[-n - 1])
+    if last is None or base is None or base <= 0:
+        return None
+    return last / base - 1.0
 
 
 def _slope_norm(series: list, n: int) -> Optional[float]:
@@ -91,15 +129,18 @@ def _slope_norm(series: list, n: int) -> Optional[float]:
 def _rs_block(df, bench, tag: str) -> tuple[dict, dict]:
     vals: dict = {}
     why: dict = {}
-    a, b = align(df, bench)
+    a, b, last = align_with_asof(df, bench)
     vals[f"rs_{tag}_samples"] = len(a)
+    vals[f"rs_{tag}_as_of"] = last
+    if last is None:
+        why[f"rs_{tag}_as_of"] = "和这个基准一天都对不上（没有可用的重叠交易日）"
     if len(a) < 2:
         for k in ([f"rs_{tag}_slope_20", f"rs_{tag}_new_high_{RS_HIGH_N}"]
                   + [f"excess_{tag}_{w}" for w in EXCESS_WINDOWS]):
             vals[k] = None
             why[k] = ("没有基准面板" if bench is None or not len(bench)
                       else f"与基准按日期对齐后只剩 {len(a)} 个交易日")
-        return vals, why
+        return scrub(vals, why)
 
     rs = [x / y for x, y in zip(a, b) if y > 0]
     s = _slope_norm(rs, RS_SLOPE_N)
@@ -119,8 +160,16 @@ def _rs_block(df, bench, tag: str) -> tuple[dict, dict]:
         k = f"excess_{tag}_{w}"
         vals[k] = round(ra - rb, 5) if (ra is not None and rb is not None) else None
         if vals[k] is None:
-            why[k] = f"对齐后不足 {w + 1} 个交易日（有 {len(a)} 个）"
-    return vals, why
+            # **原因要说对是哪一边、为什么。** 原来一律写"对齐后不足 N 个交易日"，
+            # 而长度够、只是端点不可用时，那句话是假的——一个错的原因
+            # 比没有原因更糟：它会让下一个人去查一个不存在的问题。
+            if len(a) < w + 1:
+                why[k] = f"可用样本不足 {w + 1} 个交易日（有 {len(a)} 个）"
+            else:
+                side = "个股" if ra is None else "基准"
+                why[k] = (f"{side}在 {w} 日窗口的端点价不可用"
+                          f"（非有限数或 ≤0）—— 样本数 {len(a)} 是够的")
+    return scrub(vals, why)
 
 
 def measure(df, bench=None, sector_bench=None,
@@ -137,4 +186,4 @@ def measure(df, bench=None, sector_bench=None,
         v, w = _rs_block(df, bm, tag)
         vals.update(v)
         why.update(w)
-    return vals, why
+    return scrub(vals, why)

@@ -38,6 +38,7 @@ from __future__ import annotations
 import hashlib
 from typing import Optional
 
+from .numbers import scrub
 from .volatility import ATR_ZONE_N, atr
 
 PIVOT_WINDOW = 5
@@ -229,7 +230,7 @@ def measure(df) -> tuple[dict, dict]:
         vals[k] = round((close - lo) / (hi - lo), 4) if hi > lo else None
         if vals[k] is None:
             why[k] = "区间内最高价等于最低价（无波动），位置无定义"
-    return vals, why
+    return scrub(vals, why)
 
 
 def observed_pivot_cutoff(n_rows: int) -> Optional[int]:

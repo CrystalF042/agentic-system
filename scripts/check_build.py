@@ -2935,10 +2935,13 @@ def _b110_lineage_pit_and_review():
 
     # 复核台账：三档、非法值报错、改主意留痕
     with tempfile.TemporaryDirectory() as tmp:
-        oldp = rv.REVIEW_PATH
+        oldp, oldl = rv.REVIEW_PATH, rv.LEGACY_REVIEW_PATH
         try:
             rv.REVIEW_PATH = Path(tmp) / "r.jsonl"
-            if set(rv.VERDICTS) != {"worth", "skip", "unclear"}:
+            rv.LEGACY_REVIEW_PATH = Path(tmp) / "none.jsonl"
+            # **进分母的判断仍然只有三档**（build118 加的 excluded 是第四个
+            # verdict，但它不是对标的的判断，不进分母 —— 见 review.JUDGEMENTS）
+            if set(rv.JUDGEMENTS) != {"worth", "skip", "unclear"}:
                 return False
             rv.mark("2026-09-01", "A", "worth", "x")
             rv.mark("2026-09-01", "A", "skip", "改主意")
@@ -2954,7 +2957,7 @@ def _b110_lineage_pit_and_review():
             except ValueError:
                 pass
         finally:
-            rv.REVIEW_PATH = oldp
+            rv.REVIEW_PATH, rv.LEGACY_REVIEW_PATH = oldp, oldl
     # 卡片上要盖 setup_fingerprint，否则血统缺一角
     src = (Path(__file__).resolve().parents[1] / "src" / "cio" / "technical"
            / "store.py").read_text("utf-8")
@@ -2982,6 +2985,2300 @@ def _b110_lineage_pit_and_review():
         finally:
             sto.CARD_DIR = oldd
     return True
+
+
+def _b111_nan_is_the_third_state():
+    """**NaN 既不是 None 也不是数 —— v1 漏掉的第三种状态。**
+
+    2026-09-02 全市场 502 只那一跑暴露：分位数不再单调递增
+    （`cmf_20` 的 p10 > p25，`rs_mkt_slope_20` 的 p50 直接是 nan），
+    因为 `sorted()` 遇到 NaN 会**静默**给出乱序。
+
+    更严重的一半在判定层：一根缺量的 K 线让三个量能指标全变 NaN，
+    `reasons` 里什么都不写（NaN 不是 None），`NaN > 0.10` 静默返回 False，
+    `unknown` 是空的 —— **"算不出来"被记成了"不成立"**，
+    于是那只票被无声地排除在命中之外，而卡片看起来完整。
+    """
+    import math
+    import pandas as pd
+    from cio.technical import numbers as num
+    from cio.technical import observer as tob
+    from cio.technical import setups as st
+
+    if (num.finite(float("nan")) is not None or num.finite(float("inf")) is not None
+            or num.finite(0.0) != 0.0):
+        return False
+    n = 300
+    c = [100 + 0.05 * i + 8 * math.sin(2 * math.pi * i / 24) for i in range(n)]
+    df = pd.DataFrame({"date": pd.bdate_range(start="2024-01-01", periods=n),
+                       "open": c, "high": [x + 1 for x in c], "low": [x - 1 for x in c],
+                       "close": c, "volume": [1e6] * n})
+    bad = df.copy()
+    bad.loc[290, "volume"] = float("nan")
+    card = tob.observe(bad, symbol="X")           # strict：缺原因会抛
+    for k in ("cmf_20", "obv_slope_20", "up_down_volume_ratio_20"):
+        if card.volume.get(k) is not None or k not in card.reasons:
+            return False
+    if card.panel_health.get("nan_rows") != 1 or "panel_health" not in card.reasons:
+        return False
+    r = st.evaluate(card)
+    if r["hit"] is not False or "B_accumulation_proxy" not in r["unknown"]:
+        return False
+    # 体检只数不修：脏行不能被悄悄补掉
+    dirty = df.copy()
+    dirty.loc[10, "volume"] = 0.0
+    dirty.loc[20, "close"] = -1.0
+    dirty.loc[30, ["high", "low"]] = [90.0, 110.0]
+    counts, problems = num.panel_health(dirty)
+    if (counts["nonpositive_volume"] != 1 or counts["nonpositive_close"] != 1
+            or counts["inverted_bars"] != 1 or len(problems) != 3):
+        return False
+    # 嵌套也要洗，且 observe 有兜底
+    vals = {"a": float("nan"), "nested": {"x": float("inf")}}
+    why: dict = {}
+    num.scrub(vals, why)
+    if vals["a"] is not None or vals["nested"]["x"] is not None or "nested.x" not in why:
+        return False
+    src = (Path(__file__).resolve().parents[1] / "src" / "cio" / "technical"
+           / "observer.py").read_text("utf-8")
+    if "scrub(getattr(card, name), card.reasons)" not in src:
+        return False
+    # **阈值没变，但行为变了 → 版本必须变。**（她那条血统论证的第一次应用）
+    ssrc = (Path(__file__).resolve().parents[1] / "src" / "cio" / "technical"
+            / "setups.py").read_text("utf-8")
+    return (st.SETUP_VERSION == "setup-1.0.1"
+            and st.params_fingerprint() == st.FROZEN_FINGERPRINT
+            and "1.0.0 → 1.0.1" in ssrc)
+
+
+def _b112_v2_score_and_backtest_discipline():
+    """**v2：闸门决定有没有，排名决定先看谁；回测不许回流。**
+
+    v2 是被数据逼出来的：2026-09-04 的基础率显示，固定阈值下同一条规则
+    在不同的日子会推 14 只或 109 只（量比≥1.5 的日间区间 2.8%–21.7%）。
+    这不是信号强弱，是市场整体波动在变，而人的注意力预算是固定的。
+
+    但排名不能单独用——**任何一天都有人在前 5%**，只用排名就永远说不出
+    "今天没有"，而那是 v1 的第一条边界。所以闸门在前、排名在后。
+
+    最后一条最重要：**看完收益不许回头调阈值。** 这条写成 import 约束，
+    不是写成承诺——`score.py` / `setups.py` 不许 import `backtest`。
+    """
+    import ast
+    import math
+    import pandas as pd
+    from cio.technical import backtest as bt
+    from cio.technical import observer as tob
+    from cio.technical import score as sc
+
+    tech = Path(__file__).resolve().parents[1] / "src" / "cio" / "technical"
+
+    # 定义层不许看见结果层
+    for name in ("score.py", "setups.py"):
+        for n in ast.walk(ast.parse((tech / name).read_text("utf-8"))):
+            mods = []
+            if isinstance(n, ast.ImportFrom):
+                mods = [n.module or ""] + [a.name for a in n.names]
+            elif isinstance(n, ast.Import):
+                mods = [a.name for a in n.names]
+            if any("backtest" in str(m) for m in mods):
+                return False
+
+    # 对照组不许匹配 setup 自己的成分（匹配掉了，差异必然接近零）
+    bsrc = (tech / "backtest.py").read_text("utf-8")
+    fn = next((n for n in ast.walk(ast.parse(bsrc))
+               if isinstance(n, ast.FunctionDef) and n.name == "pick_controls"), None)
+    if fn is None:
+        return False
+    body = ast.get_source_segment(bsrc, fn) or ""
+    for banned in ("atr_to_nearest_zone_above", "days_rvol_over_1_5_of_20", "cmf_20"):
+        if banned in body:
+            return False
+    if "atr_percentile_252" not in body or 'evaluate(c)["hit"]' not in body:
+        return False
+
+    # 没通过闸门 → 没有排名，而且能说"今天没有"
+    nrows = 300
+    c = [100 + 0.02 * i + math.sin(2 * math.pi * i / 24) for i in range(nrows)]
+    quiet = [tob.observe(pd.DataFrame({
+        "date": pd.bdate_range(start="2024-01-01", periods=nrows),
+        "open": c, "high": [x + 0.2 for x in c], "low": [x - 0.2 for x in c],
+        "close": c, "volume": [1e6] * nrows}), symbol=f"Q{i}") for i in range(4)]
+    ranked = sc.rank_day(quiet)
+    if any(r.rank is not None for r in ranked if not r.passed_gate):
+        return False
+    if not any(not r.passed_gate for r in ranked):
+        return False
+    if "今天没有" not in sc.today_line(ranked):
+        return False
+
+    # 报告必须先说它不能声称什么
+    text = "\n".join(bt.summarize(
+        {"events": [], "n_events": 0, "n_event_days": 0,
+         "day_diff": {h: [] for h in bt.HORIZONS}, "setup_id": "S",
+         "setup_version": "v", "horizons": list(bt.HORIZONS)},
+        {"universe": 10, "n_late": 0, "late_entrants": [], "note": "n"}))
+    return all(w in text for w in ("不是样本外检验", "幸存者偏差", "不许回头调阈值"))
+
+
+def _b114_market_wide_null_gets_a_voice():
+    """**一只票缺和全市场缺，不是同一件事。**
+
+    2026-09-04 真实发生过：SPY 面板对齐后只剩 20–63 天，全市场每一只票的
+    `excess_mkt_63` 同时变 null。系统在 502 张卡片上各写了一句
+    "该字段是 null"——**一个正确的事实说了 502 遍，仍然没有变成一个结论。**
+
+    判据不靠阈值：`excess_mkt_63` 和 `excess_sector_63` 是同一段代码在两个
+    基准上跑出来的，一个全空另一个基本满，**差异只可能来自基准本身**。
+    """
+    import math
+    import pandas as pd
+    from cio.technical import observer as tob
+    from cio.technical import score as sc
+    from cio.technical import sweep
+
+    nrow = 320
+    d = pd.bdate_range(start="2024-01-01", periods=nrow)
+    sector = pd.DataFrame({"date": d,
+                           "close": [100 * (1.0003 ** i) for i in range(nrow)]})
+    short = pd.DataFrame({"date": d[-40:],
+                          "close": [100 * (1.0002 ** i) for i in range(40)]})
+    base = [100 + 0.05 * i + math.sin(2 * math.pi * i / 23) for i in range(nrow)]
+    panel = pd.DataFrame({
+        "date": d, "open": base, "high": [x + 0.6 for x in base],
+        "low": [x - 0.6 for x in base], "close": base,
+        "volume": [1e6 + 2e5 * (i % 9) for i in range(nrow)]})
+    bad = [tob.observe(panel, bench=short, sector_bench=sector,
+                       symbol=f"B{k}", sector_symbol="XLK") for k in range(6)]
+    if any(c.relative_strength.get("excess_mkt_63") is not None for c in bad):
+        return False                       # 夹具没造出那个形状
+    if all(c.relative_strength.get("excess_sector_63") is None for c in bad):
+        return False                       # 两边都空就没有不对称可言
+
+    fields = [a for a, _, _, _ in sweep.benchmark_asymmetry(bad)]
+    if "excess_mkt_63" not in fields:
+        return False
+    text = "\n".join(sweep.report(bad))
+    if "一路基准坏了" not in text or "excess_sector_63" not in text:
+        return False
+
+    # 两个基准都好的时候不许报警（否则这条判据就只是个常亮的灯）
+    good = [tob.observe(panel, bench=sector, sector_bench=sector,
+                        symbol=f"G{k}", sector_symbol="XLK") for k in range(6)]
+    if sweep.benchmark_asymmetry(good):
+        return False
+
+    # 扫描只数不改
+    before = [dict(c.relative_strength) for c in bad]
+    sweep.report(bad)
+    if [dict(c.relative_strength) for c in bad] != before:
+        return False
+
+    # **扫出来没人看 = 没扫。** 快照必须真的调它。
+    snap = (Path(__file__).resolve().parent / "technical_snapshot.py").read_text("utf-8")
+    if "sweep.report(" not in snap:
+        return False
+
+    # 基准取短了必须报出来，而且要真的比较行数和请求天数
+    import ast
+    qsrc = (Path(__file__).resolve().parents[1] / "src" / "cio"
+            / "quant_data.py").read_text("utf-8")
+    fn = next((n for n in ast.walk(ast.parse(qsrc))
+               if isinstance(n, ast.FunctionDef) and n.name == "get_benchmark"), None)
+    if fn is None:
+        return False
+    body = ast.get_source_segment(qsrc, fn) or ""
+    if "benchmark_rows" not in body or "benchmark_short" not in body:
+        return False
+    cmps = [n for n in ast.walk(fn) if isinstance(n, ast.Compare)]
+    if not any("days" in ast.dump(c) and "len" in ast.dump(c) for c in cmps):
+        return False                       # 存了行数却没比 = 那个数不会变成告警
+    # **AST 只能证明那行代码在，不能证明它报的是实话。** 真调一遍（不联网）。
+    from cio import quant_data as qd
+    real, real_mkt = qd._yf_hist, qd.MARKET
+    try:
+        qd.MARKET = "us"
+        dd = pd.bdate_range(start="2024-01-01", periods=40)
+        qd._yf_hist = lambda sym, days: pd.DataFrame(
+            {"date": dd, "open": [1.0] * 40, "high": [1.0] * 40,
+             "low": [1.0] * 40, "close": [1.0] * 40, "volume": [1.0] * 40})
+        st = {}
+        if qd.get_benchmark(days=400, status=st) is None:
+            return False
+        if st.get("benchmark_rows") != 40 or st.get("benchmark_want") != 400:
+            return False                   # 报的行数不是真实行数
+        if not st.get("benchmark_short"):
+            return False
+        ff = pd.bdate_range(start="2024-01-01", periods=400)
+        qd._yf_hist = lambda sym, days: pd.DataFrame(
+            {"date": ff, "open": [1.0] * 400, "high": [1.0] * 400,
+             "low": [1.0] * 400, "close": [1.0] * 400, "volume": [1.0] * 400})
+        st2 = {}
+        qd.get_benchmark(days=400, status=st2)
+        if st2.get("benchmark_rows") != 400 or st2.get("benchmark_short"):
+            return False                   # 常亮的灯等于没有灯
+    finally:
+        qd._yf_hist, qd.MARKET = real, real_mkt
+
+    # 5/5 族 ≠ 信息齐全：两个覆盖度都要印
+    r = sc.Ranked(symbol="BBY", passed_gate=True, score=0.8554, band="HIGH",
+                  rank=1, within_budget=True, families_used=5, families_possible=5,
+                  coverage=1.0, families={f.name: 0.8 for f in sc.FAMILIES},
+                  missing={"relative_strength": ["excess_mkt_63"]})
+    dtext = "\n".join(sc.describe(r))
+    mtot = sum(len(f.members) for f in sc.FAMILIES)
+    return (f"{mtot - 1}/{mtot} 项" in dtext and "5/5 族" in dtext
+            and "100%" not in dtext)
+
+
+def _b114_one_nan_in_the_benchmark():
+    """**一根 NaN 抹掉全市场的大盘超额。** 2026-09-04 真实发生，502/502。
+
+    `_ret()` 里写的是 `series[-n-1] <= 0`——防了分母 ≤0，**没防 NaN**。
+    `NaN <= 0` 是 `False`，一路放行返回 NaN；下游 `scrub()` 收成 null 加原因，
+    看起来像"处理过了"：没崩、有解释，**信息全丢。**
+
+    形状是指纹：三个窗口一起空（分子共用 `series[-1]`），而斜率照算
+    （推导式里 `NaN > 0` 为 False，顺手滤掉了）。
+    """
+    import pandas as pd
+    from cio.technical import observer as tob
+    from cio.technical import relative_strength as rsm
+    from cio.technical import sweep
+
+    nrow = 405
+    d = pd.bdate_range(start="2024-01-01", periods=nrow)
+    stock = pd.DataFrame({"date": d,
+                          "close": [100 * (1.0004 ** i) for i in range(nrow)]})
+    sector = pd.DataFrame({"date": d,
+                           "close": [100 * (1.0003 ** i) for i in range(nrow)]})
+    spy = [100 * (1.0002 ** i) for i in range(nrow)]
+    spy[-1] = float("nan")
+    bench = pd.DataFrame({"date": d, "close": spy})
+    v, _ = rsm.measure(stock, bench=bench, sector_bench=sector, sector_symbol="XLK")
+    for w in rsm.EXCESS_WINDOWS:
+        if v.get(f"excess_mkt_{w}") is None or v.get(f"excess_sector_{w}") is None:
+            return False
+    # 样本数说的必须是"能用几天"，不是"对齐了几天"
+    if v.get("rs_mkt_samples") != nrow - 1 or v.get("rs_sector_samples") != nrow:
+        return False
+    # **个股侧的 NaN 也要丢**（只防基准侧，个股停牌那天照样收进来）
+    bad_stock = [100 * (1.0004 ** i) for i in range(nrow)]
+    bad_stock[-1] = float("nan")
+    v2, _ = rsm.measure(pd.DataFrame({"date": d, "close": bad_stock}),
+                        bench=pd.DataFrame(
+                            {"date": d,
+                             "close": [100 * (1.0002 ** i) for i in range(nrow)]}),
+                        sector_bench=sector, sector_symbol="XLK")
+    if v2.get("rs_mkt_samples") != nrow - 1:
+        return False
+    if any(v2.get(f"excess_mkt_{w}") is None for w in rsm.EXCESS_WINDOWS):
+        return False
+
+    good = [float(i + 1) for i in range(30)]
+    if rsm._ret(good, 21) is None:
+        return False
+    if rsm._ret(good[:-1] + [float("nan")], 21) is not None:
+        return False                       # 分子 NaN 却算出了收益率
+    nb = list(good)
+    nb[-22] = float("nan")
+    if rsm._ret(nb, 21) is not None:
+        return False                       # 分母 NaN 却算出了收益率
+    if rsm._ret([0.0] + good, 30) is not None:
+        return False                       # 分母 ≤0 的老保护丢了
+
+    # 基准带 NaN 要在取数那层就报出来（它影响的是全市场，不是一只票）
+    from cio import quant_data as qd
+    real, real_mkt = qd._yf_hist, qd.MARKET
+    try:
+        qd.MARKET = "us"
+        cl = [1.0] * 400
+        cl[-1] = float("nan")
+        qd._yf_hist = lambda sym, days: pd.DataFrame(
+            {"date": pd.bdate_range(start="2024-01-01", periods=400),
+             "open": [1.0] * 400, "high": [1.0] * 400, "low": [1.0] * 400,
+             "close": cl, "volume": [1.0] * 400})
+        st = {}
+        qd.get_benchmark(days=400, status=st)
+        if st.get("benchmark_last_bad") is not True or not st.get("benchmark_last_note"):
+            return False                   # 行数够就当健康 = 回到出事那版
+        if st.get("benchmark_short"):
+            return False                   # 400 行不短，不该报短
+        # **"最后一根坏"和"中间坏"必须说成两件事**——只断言"有一句提示"
+        # 是不够的：说错话的实现也有一句提示。
+        cl2 = [1.0] * 400
+        cl2[100] = float("nan")
+        qd._yf_hist = lambda sym, days: pd.DataFrame(
+            {"date": pd.bdate_range(start="2024-01-01", periods=400),
+             "open": [1.0] * 400, "high": [1.0] * 400, "low": [1.0] * 400,
+             "close": cl2, "volume": [1.0] * 400})
+        st_mid = {}
+        qd.get_benchmark(days=400, status=st_mid)
+        if st_mid.get("benchmark_last_bad") is not False:
+            return False
+        if st_mid.get("benchmark_last_note") == st.get("benchmark_last_note"):
+            return False                   # 两种情况说同一句话 = 那句话没有信息
+        if "最后一根" not in str(st.get("benchmark_last_note")):
+            return False
+    finally:
+        qd._yf_hist, qd.MARKET = real, real_mkt
+
+    # **常亮的灯 = 不亮的灯。** 修完之后那句警告不许再声称"会让超额变 null"
+    # —— yfinance 的未落定尾行每天都有，那样这盏灯就天天亮、报一个不会发生的故障。
+    note = str(st.get("benchmark_last_note") or "")
+    if not note or "变 null" in note or "同时变" in note or "丢掉" not in note:
+        return False
+    # 真实的代价必须写在卡片上：两个基准的截止日差一天
+    n2 = 405
+    d2 = pd.bdate_range(start="2024-01-01", periods=n2)
+    spy2 = [100 * (1.0002 ** i) for i in range(n2)]
+    spy2[-1] = float("nan")
+    base2 = [100 + 0.05 * i for i in range(n2)]
+    p2 = pd.DataFrame({"date": d2, "open": base2, "high": [x + 0.6 for x in base2],
+                       "low": [x - 0.6 for x in base2], "close": base2,
+                       "volume": [1e6 + 2e5 * (i % 9) for i in range(n2)]})
+    sec2 = pd.DataFrame({"date": d2,
+                         "close": [100 * (1.0003 ** i) for i in range(n2)]})
+    cc = [tob.observe(p2, bench=pd.DataFrame({"date": d2, "close": spy2}),
+                      sector_bench=sec2, symbol=f"D{k}", sector_symbol="XLK")
+          for k in range(4)]
+    mm = cc[0].relative_strength.get("rs_mkt_as_of")
+    ss = cc[0].relative_strength.get("rs_sector_as_of")
+    if not mm or not ss or mm >= ss:
+        return False
+    stext = "\n".join(sweep.report(cc))
+    if "截止日不一样" not in stext or mm not in stext or ss not in stext:
+        return False
+
+    snap = (Path(__file__).resolve().parent / "technical_snapshot.py").read_text("utf-8")
+    if "benchmark_last_note" not in snap:
+        return False                       # 报了没人印 = 没报
+    return "至少要" in snap                 # 「要 400 行」会让 1255 看起来像出错
+
+
+def _b121_scheduler_spends_a_budget_it_can_count():
+    """**那条规矩在一部门口才真的致命，而预算必须是数出来的。**
+
+    `build_unit_a(text, force=False)` 默认在 `INSUFFICIENT` 时不启动辩论。
+    路由老实放行也没用——**一部自己会把技术触发挡回去**。
+    所以调度对 TECHNICAL 必须传 `force=True`，并写明没有新的基本面事实。
+
+    另一半：Approve 挡住的是坏交易，挡不住"连着三周把研究预算花在垃圾上"，
+    而那看起来和正常运行一模一样。所以预算**从磁盘上数、每天报**。
+    """
+    import ast
+    import os as _os
+    import tempfile
+    from cio import heartbeat as hbmod
+    from cio.research import queue as rq2
+    from cio.research import router as rt2
+    from cio.research import scheduler as sc
+    from cio.research import trigger as tg2
+
+    lin = {"setup_version": "setup-1.0.1"}
+
+    # **先验真的 `_research`，再装假的。**
+    # 下面那个假 `_research` 自己会返回 NO_NEW_FACTS_NOTE ——
+    # 只断"describe 里有这句话"，验的是夹具不是代码：
+    # 把真实现里那行删掉，探针照样绿。
+    class _It:                                 # 最小替身：只有被读的两个字段
+        def __init__(self, symbol, types):
+            self.symbol, self.trigger_types = symbol, types
+
+    _t = sc._research(_It("AMD", [tg2.TECHNICAL]), "INSUFFICIENT", dry_run=True)
+    if _t.get("force") is not True or _t.get("note") != sc.NO_NEW_FACTS_NOTE:
+        return False
+    _e = sc._research(_It("BBY", [tg2.EVIDENCE]), "INSUFFICIENT", dry_run=True)
+    if _e.get("force") is not False or _e.get("note"):
+        return False                           # 不是技术触发也挂那句话
+    if sc._research(_It("AMD", [tg2.TECHNICAL]), "SUFFICIENT",
+                    dry_run=True).get("note"):
+        return False                           # 常亮的灯 = 不亮的灯
+
+    real_e, real_r = sc._enrich, sc._research
+    old_q, old_s = rq2.QUEUE_PATH, sc.SPEND_DIR
+    keep = _os.environ.get("CIO_RESEARCH_ENABLED")
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            rq2.QUEUE_PATH = Path(td) / "q.jsonl"
+            sc.SPEND_DIR = Path(td) / "spend"
+            calls = []
+            sc._enrich = lambda s: {"tier": "INSUFFICIENT", "n_sub": 0, "n": 4}
+
+            def _r(it, tr, dry_run):
+                calls.append((it.symbol, tg2.TECHNICAL in it.trigger_types, tr))
+                return {"dry_run": False, "tier": tr, "direction": "中性",
+                        "conviction": "弱",
+                        "note": sc.NO_NEW_FACTS_NOTE
+                        if tg2.TECHNICAL in it.trigger_types else ""}
+            sc._research = _r
+
+            for sym, v in [("AMD", .9), ("MU", .8), ("AVGO", .7)]:
+                for task in rt2.route([tg2.technical_trigger(
+                        sym, "2026-09-04", "2026-09-04", lin, score=v)]):
+                    rq2.enqueue(task)
+
+            # 预演：不花钱、不改状态、和真跑同一份 plan
+            before = dict(rq2.counts())
+            dry = sc.run("2026-09-04", budget=2, dry_run=True)
+            if dry["done"] or sc.spend("2026-09-04")["unit_a_calls"]:
+                return False
+            if dict(rq2.counts()) != before:
+                return False
+            if [i.symbol for i in sc.plan("2026-09-04", 2).picks] != [
+                    r["symbol"] for r in dry["results"]]:
+                return False
+
+            # 真跑：技术触发越过 INSUFFICIENT
+            res = sc.run("2026-09-04", budget=2)
+            if res["done"] != 2 or res["deferred"] != 1:
+                return False
+            if not calls or not all(f for _s, f, _t in calls):
+                return False   # force 没传下去 → 一部会 ABSTAIN
+            if res["forced_past_insufficient"] != 2:
+                return False
+            if sc.NO_NEW_FACTS_NOTE not in "\n".join(sc.describe(res)):
+                return False
+            if rq2.counts().get(rq2.DEFERRED) != 1:
+                return False   # 超预算的消失了
+
+            # 预算从磁盘数，重启不清零
+            if sc.spend("2026-09-04")["unit_a_calls"] != 2:
+                return False
+            res2 = sc.run("2026-09-04", budget=2)
+            if res2["done"] != 0 or "预算已用完" not in res2["blocked"]:
+                return False
+            if sc.spend("2026-09-04")["unit_a_calls"] != 2:
+                return False   # 超支
+
+            # 心跳：0 也要记
+            rep = hbmod.Report("2026-09-04")
+            with rep.stage("unit_a") as hb:
+                sc.run("2026-09-04", budget=2, hb=hb)
+            if hb.counts.get("budget") != 2 or "picked 0" not in rep.render():
+                return False
+
+            # 开关：关掉要看得见，且队列不被清空
+            _os.environ["CIO_RESEARCH_ENABLED"] = "0"
+            res3 = sc.run("2026-09-04", budget=99)
+            if res3["enabled"] is not False or "关掉" not in res3["blocked"]:
+                return False
+            if "被关掉" not in "\n".join(sc.describe(res3)):
+                return False
+            if len(rq2.items()) != 3:
+                return False
+            # **还得数得出来有几条在等。** 只保证"条目没被删"不够：
+            # 把等待名单清成空的，条目照样在文件里，可是关掉期间攒了 40 条
+            # 这件事没人看得见 —— 那和"今天本来就没有"长得一模一样。
+            # 前面两只已经 RESEARCHED，还在等的只剩超预算那一只
+            if res3["deferred"] != 1 or res3["picked"]:
+                return False
+            _p = sc.plan("2026-09-04", 99)
+            if [i.symbol for i in _p.deferred] != ["AVGO"] or _p.picks:
+                return False
+            if "关掉" not in "\n".join(_p.describe()):
+                return False
+
+            # **先记账再花钱，失败也不消失。** 换一份干净的队列和账本再来：
+            # 一次模型超时不能让一只票从世界上消失，也不能因为崩了就把
+            # 那次调用算成"没花过" —— 一条反复崩溃的记录会每天吃掉整份预算，
+            # 而它看起来和正常排队一模一样。
+            _os.environ.pop("CIO_RESEARCH_ENABLED", None)
+            rq2.QUEUE_PATH = Path(td) / "q2.jsonl"
+            sc.SPEND_DIR = Path(td) / "spend2"
+
+            def _boom(it, tr, dry_run):
+                raise RuntimeError("模型超时")
+            sc._research = _boom
+            for task in rt2.route([tg2.technical_trigger(
+                    "NVDA", "2026-09-04", "2026-09-04", lin, score=.9)]):
+                rq2.enqueue(task)
+            res4 = sc.run("2026-09-04", budget=2)
+            if res4["failed"] != 1 or res4["done"]:
+                return False
+            if sc.spend("2026-09-04")["unit_a_calls"] != 1:
+                return False        # 崩了就不算花过 → 每天吃掉整份预算
+            if rq2.counts().get(rq2.FAILED) != 1:
+                return False        # 条目消失在流程里
+            if "失败" not in "\n".join(sc.describe(res4)):
+                return False
+    finally:
+        sc._enrich, sc._research = real_e, real_r
+        rq2.QUEUE_PATH, sc.SPEND_DIR = old_q, old_s
+        if keep is None:
+            _os.environ.pop("CIO_RESEARCH_ENABLED", None)
+        else:
+            _os.environ["CIO_RESEARCH_ENABLED"] = keep
+
+    # 结构：force 真的传给了 build_unit_a，且按 TECHNICAL 判
+    src = (Path(__file__).resolve().parents[1] / "src" / "cio" / "research"
+           / "scheduler.py").read_text("utf-8")
+    tree = ast.parse(src)
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name == "_research"), None)
+    if fn is None:
+        return False
+    body = ast.get_source_segment(src, fn) or ""
+    if "force=force" not in body or "TECHNICAL in" not in body:
+        return False
+    # 那句话**只能有一个出处**：预演一处、真跑一处地判两次，
+    # 上面用预演验的那条断言删掉真跑那处照样绿。
+    if "_note_for(" not in body or "NO_NEW_FACTS_NOTE" in body:
+        return False
+    # 补材料那一步不许调模型；run() 里不许按 Evidence 档位分支
+    en = next((n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name == "_enrich"), None)
+    if en is None or "build_unit_a" in (ast.get_source_segment(src, en) or ""):
+        return False
+    runfn = next((n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "run"), None)
+    for node in ast.walk(runfn):
+        if isinstance(node, ast.If):
+            if "INSUFFICIENT" in (ast.get_source_segment(src, node.test) or ""):
+                return False
+    return True
+
+
+def _b124_a_failed_call_never_becomes_an_argument():
+    """**辩论换引擎：失败绝不返回提示词，钱是第二道闸。**
+
+    `Ollama.chat()` 失败时 `return truncate(prompt, 240)` —— 于是
+    "多头论点"变成提示词的前 240 字，**没有异常、报告照出**，
+    然后走完闸门、进论点台账、被 CRO 定仓、推到 CEO 面前。
+    本地模型很少挂所以一直没咬到人；换成远程 API 之后，
+    限流 / 529 / 超时**每天都可能发生**。
+
+    其余不变量：拼错的 spec / 没 key 都不许悄悄退回本地；
+    token 是事实、钱是按带日期的表估的；不在表里 ≠ 免费；
+    材料出不出本机报告上说得出来；论点记得住是谁写的。
+    """
+    import ast
+    import os as _os
+    import tempfile
+    from cio import llm as _llm
+    from cio import models as _m
+    from cio import ollama_client as _oc
+    from cio import thesis_store as _ts
+    from cio.research import queue as rq4
+    from cio.research import router as rt4
+    from cio.research import scheduler as sc4
+    from cio.research import trigger as tg4
+
+    root = Path(__file__).resolve().parents[1]
+
+    # ---- 一、失败必须抛，且异常里不带提示词 ----
+    o = _oc.Ollama()
+    o.mock = False
+
+    class _Boom:
+        def post(self, *a, **k):
+            raise RuntimeError("connection refused")
+    o._client = _Boom()
+    prompt = "你是多头。请基于以下材料建案：[1] 某公司发布新品……" * 20
+    soft = o.chat(prompt, strict=False)
+    # 非 strict 仍然回一段提示词的回声（`truncate` 会加省略号，所以断前缀
+    # 而不是断子串）。翻译/摘要那三处靠它 + `_strip_echo` 兜底。
+    if not soft or not prompt.startswith(soft[:40]):
+        return False
+    try:
+        o.chat(prompt, strict=True)
+        return False        # strict 却没抛 → 240 个字会变成「多头论点」
+    except RuntimeError:
+        pass
+
+    # ---- 二、结构：辩论与判定走 strict；一部走引擎层 ----
+    jsrc = (root / "src" / "cio" / "judge.py").read_text("utf-8")
+    jf = next((n for n in ast.walk(ast.parse(jsrc))
+               if isinstance(n, ast.FunctionDef) and n.name == "ollama_chat"), None)
+    if jf is None or "strict=True" not in (ast.get_source_segment(jsrc, jf) or ""):
+        return False
+    # **断结构，不要断文本。** 断 `"llm.engine()" in 源码` 会被
+    # 源码里那行注释满足；断 `"engine=oll.spec" in 源码` 会被
+    # `UnitAAdvice(...)` 里的那一份满足，**而台账那一处删掉照样绿**。
+    ua = (root / "src" / "cio" / "unit_a.py").read_text("utf-8")
+    utree = ast.parse(ua)
+    uf = next((n for n in ast.walk(utree)
+               if isinstance(n, ast.FunctionDef) and n.name == "build_unit_a"), None)
+    if uf is None:
+        return False
+    got = None
+    for node in ast.walk(uf):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                and isinstance(node.targets[0], ast.Name) \
+                and node.targets[0].id == "oll" \
+                and isinstance(node.value, ast.Call):
+            f = node.value.func
+            got = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
+    if got != "engine":
+        return False        # 一部还钉死在本地模型上
+    rec = [n for n in ast.walk(utree)
+           if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+           and n.func.attr == "record"
+           and getattr(n.func.value, "id", "") == "thesis_store"]
+    if not rec or any("engine" not in {k.arg for k in c.keywords} for c in rec):
+        return False        # 论点台账收不到引擎 → 两个引擎永远比不出高下
+
+    # ---- 三、spec 不许悄悄退回 ----
+    for bad in ("gpt-oss:20b", "claude", "openai:gpt-4", "ollama:"):
+        try:
+            _llm.parse_spec(bad)
+            return False
+        except ValueError:
+            pass
+    if _llm.parse_spec("claude:claude-sonnet-5") != ("claude", "claude-sonnet-5"):
+        return False
+    keep_env = {k: _os.environ.get(k) for k in
+                ("CIO_DEBATE_ENGINE", "CIO_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY")}
+    try:
+        _os.environ.pop("CIO_DEBATE_ENGINE", None)
+        if _llm.parse_spec() != ("ollama", "gpt-oss:20b"):
+            return False    # 默认漂走了 —— 换引擎必须是明确动作
+        # 没 key 就停，不退回本地
+        _os.environ["CIO_ANTHROPIC_API_KEY"] = ""
+        _os.environ["ANTHROPIC_API_KEY"] = ""
+        eng = _llm.engine("claude:claude-sonnet-5")
+        if eng.remote is not True:
+            return False
+        try:
+            eng.chat("你好", system="s")
+            return False
+        except _llm.EngineError as e:
+            if "API key" not in str(e) or "不会自动退回本地" not in str(e):
+                return False
+        # **远程那条路的失败也必须抛。** 没 key 会更早地停，
+        # 有 key 又会真的联网 —— 所以那一半够不着，而它恰恰是换成
+        # Claude 之后每天都会发生的那一半（限流 / 529 / 超时）。
+        import httpx as _hx
+        real_post = _hx.post
+        _os.environ["CIO_ANTHROPIC_API_KEY"] = "sk-test-not-real"
+        eng2 = _llm.engine("claude:claude-sonnet-5")
+        long_prompt = "你是多头。请基于以下材料建案……" * 30
+        try:
+            _hx.post = lambda *a, **k: (_ for _ in ()).throw(
+                RuntimeError("429 rate limit"))
+            try:
+                eng2.chat(long_prompt, system="s")
+                return False        # 远程失败没抛 → 240 字变成「多头论点」
+            except _llm.EngineError as e:
+                if long_prompt[:60] in str(e):
+                    return False    # 异常里把提示词带出来了
+
+            class _Empty:
+                def raise_for_status(self):
+                    return None
+
+                def json(self):
+                    return {"content": [], "stop_reason": "max_tokens",
+                            "usage": {"input_tokens": 10, "output_tokens": 0}}
+            _hx.post = lambda *a, **k: _Empty()
+            try:
+                eng2.chat(long_prompt, system="s")
+                return False        # 空回复被当成了「多头论点」
+            except _llm.EngineError as e:
+                if "空内容" not in str(e):
+                    return False
+        finally:
+            _hx.post = real_post
+    finally:
+        for k, v in keep_env.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+
+    # ---- 四、token 是事实，钱是估算；不在表里 ≠ 免费 ----
+    u = _llm.Usage(engine="claude:claude-sonnet-5")
+    u.add(26000, 5000, "claude-sonnet-5")
+    if u.input_tokens != 26000 or u.output_tokens != 5000 or not u.priced:
+        return False
+    if abs(u.usd - (26000 * 2 + 5000 * 10) / 1e6) > 1e-9:
+        return False
+    if _llm.PRICE_TABLE_AS_OF not in u.describe():
+        return False        # 算出来的钱说不出是哪天的表
+    usd, priced = _llm.estimate_usd("claude-something-new-9", 1_000_000, 1_000_000)
+    if usd != 0.0 or priced is not False:
+        return False        # 不知道多少钱被记成了免费
+    if _llm.estimate_usd("gpt-oss:20b", 999, 999) != (0.0, True):
+        return False        # 本地模型是真的不花钱
+
+    # ---- 五、max_tokens 不是抄来的 400（断结构，不断文本）----
+    lsrc = (root / "src" / "cio" / "llm.py").read_text("utf-8")
+    cf = next((n for n in ast.walk(ast.parse(lsrc))
+               if isinstance(n, ast.FunctionDef) and n.name == "_claude"), None)
+    if cf is None:
+        return False
+    seen_mt = False
+    for node in ast.walk(cf):
+        if isinstance(node, ast.Dict):
+            for k, v in zip(node.keys, node.values):
+                if isinstance(k, ast.Constant) and k.value == "max_tokens":
+                    seen_mt = True
+                    if not (isinstance(v, ast.Name) and v.id == "MAX_TOKENS"):
+                        return False
+    if not seen_mt or _llm.MAX_TOKENS < 1500:
+        return False
+    body = ast.get_source_segment(lsrc, cf) or ""
+    if "if not text" not in body or "EngineError" not in body:
+        return False        # 空回复被当成「它没话说」
+
+    # ---- 六、材料出不出本机，说得出来 ----
+    loc = _llm.describe_spec("ollama:gpt-oss:20b")
+    rem = _llm.describe_spec("claude:claude-sonnet-5")
+    if "不出本机" not in loc or "发到本机之外" not in rem:
+        return False
+    for need in ("持仓", "净值", "论点台账", "账本"):
+        if need not in rem:
+            return False
+
+    # ---- 七、引擎血统落在产出与台账上 ----
+    a = _m.UnitAAdvice(subject="AMD")
+    for f in ("engine", "engine_remote", "usage"):
+        if not hasattr(a, f):
+            return False
+    if "engine" not in [c for c, _d in _ts._ADD_COLUMNS]:
+        return False
+
+    # ---- 八、钱是第二道闸 ----
+    old_s, old_q = sc4.SPEND_DIR, rq4.QUEUE_PATH
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            sc4.SPEND_DIR = Path(td) / "spend"
+            rq4.QUEUE_PATH = Path(td) / "q.jsonl"
+            day = "2026-09-04"
+            sc4.record_spend(day, "AMD", "new_thesis")
+            sc4.record_spend(day, "AMD", "new_thesis",
+                             usage={"input_tokens": 26000, "output_tokens": 5000,
+                                    "usd": 6.0, "engine": "claude:claude-sonnet-5",
+                                    "priced": True, "price_table_as_of": "2026-09-05"})
+            s = sc4.spend(day)
+            if s.get("unit_a_calls") != 1:
+                return False    # 补记多算了一次
+            if s.get("input_tokens") != 26000 or abs(s.get("usd", 0) - 6.0) > 1e-9:
+                return False
+            if (s.get("symbols") or [{}])[0].get("usd") != 6.0:
+                return False    # 逐票花了多少说不出来
+            # **次数还剩 4，钱已经超了** —— 判别力在这一半
+            if sc4.remaining(day, budget=5) != 4:
+                return False
+            if not sc4.over_usd_budget(day, cap=5.0):
+                return False
+            if sc4.over_usd_budget(day, cap=0):
+                return False    # cap<=0 该是不限
+            for task in rt4.route([tg4.technical_trigger(
+                    "AMD", "2026-09-04", "2026-09-04",
+                    {"setup_version": "setup-1.0.1"}, score=0.9)]):
+                rq4.enqueue(task)
+            p = sc4.plan(day, budget=5)
+            if not p.blocked or "花费" not in p.blocked:
+                return False
+            if "预算已用完" in p.blocked:
+                return False    # 钱花完了却说成次数用完了
+            if p.picks or len(p.deferred) != 1:
+                return False
+    finally:
+        sc4.SPEND_DIR, rq4.QUEUE_PATH = old_s, old_q
+    return True
+
+
+def _b123_a_rehearsal_is_not_a_delivery():
+    """**「N 条提案等你批准」这句话，到没到她手机上。**
+
+    `deliver.send_text()` 在 `CIO_TG_DRYRUN=1` 时 return True ——
+    "演习"和"真发出去了"在返回值上长得一样。照着它记通知台账：
+
+        演习跑一次 → 台账记「已通知」 → 以后不再推
+        → 那条真正要她批的消息，一次都不会发出去
+
+    所以四态，**只有 SENT 写台账**；另外三个都要重试，
+    其中"没配置 / 失败"还要点告警，而"演习"不点（有意不发 ≠ 没送到）。
+
+    其余不变量：去重按内容不按条数、挂太久越过去重再提醒（按交易日）、
+    快过期要说出来、0 条不发消息、按钮和命令行两条路都给。
+    """
+    import tempfile
+    from cio import heartbeat as hbmod
+    from cio import notify as nt
+    from cio import proposal_store as ps3
+
+    old_state, real_send, real_pending = nt.STATE_PATH, nt._send, ps3.pending
+    PID = "TEST"
+
+    def _row(pid=1, ticker="AMD", delta=10, shares=10,
+             decision_date="2026-09-04", expires="2026-09-30"):
+        return {"id": pid, "ticker": ticker, "action": "BUY",
+                "delta_shares": delta, "current_shares": 0,
+                "target_shares": shares, "decision_date": decision_date,
+                "expires_on": expires, "decision_price": 180.0,
+                "target_weight": 0.04, "compliance_status": "PASS",
+                "state": ps3.PENDING_APPROVAL}
+
+    calls = []
+    box = {"outcome": nt.SENT}
+
+    def _fake_send(text, keyboard, dry_run=False):
+        calls.append({"text": text, "kb": keyboard, "dry_run": dry_run})
+        return nt.DRYRUN if dry_run else box["outcome"]
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            nt.STATE_PATH = Path(td) / "pending.json"
+            nt._send = _fake_send
+            ps3.pending = lambda pid: [_row()]
+
+            # (a) **演习不写台账**，而且下一次真发还得推
+            r = nt.notify_pending(PID, "2026-09-04", dry_run=True)
+            if r["outcome"] != nt.DRYRUN or r["sent"]:
+                return False
+            if nt.state(PID)["fingerprint"] or nt.state(PID)["n_sent"]:
+                return False
+            r = nt.notify_pending(PID, "2026-09-04")
+            if not r["sent"] or nt.state(PID)["n_sent"] != 1:
+                return False
+
+            # (b) 同一批不重复轰炸
+            n0 = len(calls)
+            if nt.notify_pending(PID, "2026-09-04")["sent"]:
+                return False
+            if len(calls) != n0:
+                return False
+
+            # (c) **条数一样、内容全变 → 必须推**（去重按内容）
+            ps3.pending = lambda pid: [_row(2, "MU")]
+            if not nt.notify_pending(PID, "2026-09-04")["sent"]:
+                return False
+            if "MU" not in calls[-1]["text"]:
+                return False
+            # 连股数变了也要推 —— 批准的是股数
+            ps3.pending = lambda pid: [_row(2, "MU", delta=99, shares=99)]
+            if not nt.notify_pending(PID, "2026-09-04")["sent"]:
+                return False
+
+            # (d) **挂太久越过去重**，而且按交易日算
+            fri = [_row(3, "AVGO", decision_date="2026-09-04")]
+            ps3.pending = lambda pid: fri
+            nt.notify_pending(PID, "2026-09-04")
+            n1 = len(calls)
+            if nt.notify_pending(PID, "2026-09-07")["sent"]:
+                return False        # 周一 = 1 个交易日，还不到提醒线
+            r = nt.notify_pending(PID, "2026-09-08")
+            if not r["sent"] or not r["reminding"] or r["aged"] != 1:
+                return False
+            if len(calls) != n1 + 1 or "已挂" not in calls[-1]["text"]:
+                return False
+            if nt.notify_pending(PID, "2026-09-08")["sent"]:
+                return False        # 同一天提醒两次
+
+            # (e) **快过期要说出来，而且是告警**
+            ps3.pending = lambda pid: [_row(4, "NVDA", expires="2026-09-05")]
+            rep = hbmod.Report("2026-09-04")
+            with rep.stage("ceo") as hb:
+                r = nt.notify_pending(PID, "2026-09-04", hb=hb)
+            if r["expiring"] != 1 or "过期作废" not in calls[-1]["text"]:
+                return False
+            if not any("过期作废" in t for _l, t in rep.alerts()):
+                return False
+
+            # (f) **没送到 = 告警**；**演习 ≠ 告警**
+            box["outcome"] = nt.FAILED
+            ps3.pending = lambda pid: [_row(5, "SLB")]
+            rep2 = hbmod.Report("2026-09-04")
+            with rep2.stage("ceo") as hb2:
+                r = nt.notify_pending(PID, "2026-09-04", hb=hb2)
+            if r["sent"] or nt.state(PID)["fingerprint"] == r["fingerprint"]:
+                return False        # 失败却记进了台账
+            if not any("没送到" in t for _l, t in rep2.alerts()):
+                return False
+            if "没送到" not in rep2.render().split("[技术快照]")[0]:
+                return False        # 告警没印在最上方
+            box["outcome"] = nt.SENT
+            rep3 = hbmod.Report("2026-09-04")
+            with rep3.stage("ceo") as hb3:
+                nt.notify_pending(PID, "2026-09-04", hb=hb3, dry_run=True)
+            if rep3.alerts():
+                return False        # 演习点了灯 —— 常亮的灯 = 不亮的灯
+
+            # (g) **0 条不发消息**，但心跳里有
+            ps3.pending = lambda pid: []
+            n2 = len(calls)
+            rep4 = hbmod.Report("2026-09-04")
+            with rep4.stage("ceo") as hb4:
+                r = nt.notify_pending(PID, "2026-09-04", hb=hb4)
+            if r["pending"] or len(calls) != n2 or rep4.alerts():
+                return False
+            if hb4.counts.get("pending") != 0 or "pending 0" not in rep4.render():
+                return False
+
+            # (h) **按钮和命令行两条路都给**
+            ps3.pending = lambda pid: [_row(6, "BBY")]
+            nt.notify_pending(PID, "2026-09-04", force=True)
+            txt, kb = calls[-1]["text"], calls[-1]["kb"]
+            for need in ("run_approve.py --approve", "run_tgbot.py", "整数股数"):
+                if need not in txt:
+                    return False
+            if not kb or kb[0][0]["callback_data"] != "ap:6":
+                return False
+
+            # (i) **台账读不动时宁可多推，不许沉默**
+            # 断在 state() 上，不只断"结果推了"：随便返回一个假指纹
+            # 也会让它推，那样这一段对"读不动被当成已通知"没有判别力。
+            nt.STATE_PATH.write_text("{ 不是 json", encoding="utf-8")
+            st = nt.state(PID)
+            if st.get("fingerprint") or st.get("n_sent") \
+                    or st.get("last_sent_day") or st.get("last_reminded_day"):
+                return False        # 读不动却记着一批 = 提醒会永远停发
+            n3 = len(calls)
+            if not nt.notify_pending(PID, "2026-09-04")["sent"]:
+                return False
+            if len(calls) != n3 + 1 or nt.state(PID)["n_sent"] != 1:
+                return False
+    finally:
+        nt.STATE_PATH, nt._send, ps3.pending = old_state, real_send, real_pending
+
+    # 四态里只有一个算送到
+    if nt.DELIVERED != (nt.SENT,):
+        return False
+    if set(nt.OUTCOMES) != {nt.SENT, nt.DRYRUN, nt.UNCONFIGURED, nt.FAILED}:
+        return False
+    return True
+
+
+def _b122_automation_stops_at_the_capital_gate():
+    """**自动化跑到「待你批准」必须停，而且是代码保证的。**
+
+    她定的那条：可见性到处都有，硬闸只有一道。而"只有一道"如果只是
+    我们的约定，那它就不是闸。所以钉三层：
+
+        状态机   APPROVED 只能从 PENDING_APPROVAL 来
+        源码     自动那几个模块里不许出现把状态改成 APPROVED 的调用
+        跑一遍   终点是 PENDING_APPROVAL，且没有一条自己进了 APPROVED
+
+    另外三条这一版的不变量：
+    **口径不符 ≠ 否决**（一个错的原因比没有原因更糟）、
+    **算不出仓位 ≠ 被否决**（合成一个就答不出那道闸拦下过什么）、
+    **有目标却没落成提案要喊**（否则和"今天没有目标"长得一样）。
+    """
+    import ast
+    import tempfile
+    from cio import heartbeat as hbmod
+    from cio import proposal_store as ps2
+    from cio import propose as pp2
+    from cio.research import pipeline as pl2
+    from cio.research import queue as rq3
+    from cio.research import router as rt3
+    from cio.research import trigger as tg3
+
+    root = Path(__file__).resolve().parents[1]
+    lin = {"setup_version": "setup-1.0.1"}
+
+    # ---- 一、状态机：APPROVED 只有一条入边 ----
+    for st in rq3.STATES:
+        if st == rq3.PENDING_APPROVAL:
+            continue
+        if rq3.APPROVED in rq3.LEGAL.get(st, ()):
+            return False
+    if rq3.APPROVED not in rq3.LEGAL[rq3.PENDING_APPROVAL]:
+        return False
+    # VETOED 与 NO_TRADE 是两个不同的终态
+    if rq3.VETOED == rq3.NO_TRADE or rq3.NO_TRADE not in rq3.TERMINAL:
+        return False
+
+    # ---- 二、源码：自动链上没有批准动作 ----
+    for rel in ("src/cio/research/pipeline.py", "src/cio/research/scheduler.py",
+                "src/cio/research/router.py", "src/cio/propose.py",
+                "src/cio/notify.py", "scripts/research_run.py",
+                "scripts/notify_run.py"):
+        src = (root / rel).read_text("utf-8")
+        for node in ast.walk(ast.parse(src)):
+            if not isinstance(node, ast.Call):
+                continue
+            f = node.func
+            nm = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
+            if nm != "transition":
+                continue
+            seg = ast.get_source_segment(src, node) or ""
+            if "APPROVED" in seg and "PENDING_APPROVAL" not in seg:
+                return False
+
+    # ---- 三、跑一遍 ----
+    old_q = rq3.QUEUE_PATH
+    real_prop, real_pending = pp2.for_run, ps2.pending
+    real_rec, real_th = pl2._record, pl2._thesis_for
+    import cio.cro_inputs as ci2
+    import cio.regime as rg2
+    import cio.risk_officer as ro2
+    import cio.sizing as sz2
+    keep = (ci2.measures_for, ro2.assess_one, sz2.size_one, rg2.assess)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            rq3.QUEUE_PATH = Path(td) / "q.jsonl"
+            pl2._record = lambda item, cro, sz: None
+            pl2._thesis_for = lambda s, tid: {
+                "id": 7, "direction": "看多", "conviction": "中",
+                "invalidations": ["x"], "material_verdict": "SUFFICIENT"}
+            ci2.measures_for = lambda s: {"sigma_60": .3, "sigma_252": .28,
+                                          "beta": 1.1, "maxdd": -.2,
+                                          "corr_bench": .7, "liquidity_cap": None,
+                                          "beta_n_aligned": 300}
+            rg2.assess = lambda fetch=None: {"regime": "neutral", "note": ""}
+            state = {"veto": False, "units": False, "w": 0.04}
+
+            def _assess(**kw):
+                if state["units"]:
+                    raise ValueError("sigma_60=40.74 是百分数，POLICY 用小数")
+                return {"ticker": kw["ticker"], "direction": "看多",
+                        "conviction": "中", "evidence_gate": "SUFFICIENT",
+                        "thesis_id": 7, "regime": "neutral",
+                        "base_risk_budget": .02, "conviction_multiplier": 1.0,
+                        "regime_multiplier": 1.0, "adjusted_risk_budget": .02,
+                        "caps": {"single_name": .08}, "measures": {},
+                        "risk_constraints": [], "binding_risk_constraint": "",
+                        "veto": state["veto"], "veto_reason": "Beta 2.30 触及否决线 2.00",
+                        "portfolio_risk_cap": .2, "notes": []}
+            ro2.assess_one = _assess
+            sz2.size_one = lambda **kw: {
+                "ticker": kw["ticker"], "evidence_gate": "SUFFICIENT",
+                "sigma_60": .3, "sigma_252": .28, "sigma_blend": .29,
+                "sigma_floor": .15, "sigma_effective": .29,
+                "sigma_binding_component": ["sigma_60"], "w_raw": .069,
+                "w_final": state["w"], "caps_evaluated": ["single_name"],
+                "caps_not_evaluated": [],
+                "binding_position_constraint": (["single_name"] if state["w"]
+                                                is not None else []),
+                "reason": "" if state["w"] is not None else "σ 算不出来"}
+
+            def _mk(sym, score):
+                for t in rt3.route([tg3.technical_trigger(
+                        sym, "2026-09-04", "2026-09-04", lin, score=score)]):
+                    rq3.enqueue(t)
+                it = [i for i in rq3.items().values() if i.symbol == sym][0]
+                for s in (rq3.ENRICHING, rq3.RESEARCHING, rq3.RESEARCHED):
+                    rq3.transition(it.key, s, "t")
+                return it.key
+
+            # (a) 正常：走到 PENDING_APPROVAL 并挂上提案号，**不许自己 APPROVED**
+            k = _mk("AMD", .9)
+            pp2.for_run = lambda **kw: {
+                "status": pp2.COMPLETED, "note": "", "run_id": kw["run_id"],
+                "saved": [{"id": 91, "ticker": "AMD", "action": "BUY",
+                           "state": ps2.PENDING_APPROVAL}],
+                "expired": [], "decisions": [], "rows": [], "summary": {},
+                "compliance": {}, "expires": "", "nav": {}, "prices": {},
+                "price_detail": {}, "held": {}, "n_marked": 0, "renders": {}}
+            ps2.pending = lambda pid: [{"id": 91}]
+            rep = hbmod.Report("2026-09-04")
+            with rep.stage("cro_pc") as hb:
+                r1 = pl2.advance("2026-09-04", portfolio_id="TEST", hb=hb)
+            if r1["targets"] != 1 or rq3.get(k).state != rq3.PENDING_APPROVAL:
+                return False
+            if rq3.get(k).proposal_id != 91:
+                return False        # 队列和提案库对不上
+            if rq3.counts().get(rq3.APPROVED, 0):
+                return False        # 自动化自己越过了授权闸
+            if not r1["reconcile"]["ok"] or rep.alerts():
+                return False        # 一切正常却点了灯 —— 常亮的灯 = 不亮的灯
+            if hb.counts.get("picked") != 1 or hb.counts.get("vetoed") != 0:
+                return False        # 0 也要记
+
+            # (b) 口径不符：**不是否决**
+            state["units"] = True
+            k2 = _mk("BBY", .8)
+            r2 = pl2.advance("2026-09-04", portfolio_id="TEST")
+            if r2["unmeasurable"] != 1 or r2["vetoed"] or r2["targets"]:
+                return False
+            if rq3.get(k2).state != rq3.FAILED or "口径" not in rq3.get(k2).note:
+                return False
+            if "否决" in rq3.get(k2).note:
+                return False        # 未评估被写成了风险判断
+            state["units"] = False
+
+            # (c) 否决：终态 VETOED，而且走 alert 不走 note
+            state["veto"] = True
+            k3 = _mk("MU", .7)
+            rep3 = hbmod.Report("2026-09-04")
+            with rep3.stage("cro_pc") as hb3:
+                r3 = pl2.advance("2026-09-04", portfolio_id="TEST", hb=hb3)
+            if r3["vetoed"] != 1 or rq3.get(k3).state != rq3.VETOED:
+                return False
+            al = rep3.alerts()
+            if not al or not any("MU" in t for _l, t in al):
+                return False
+            if any("MU" in n for n in hb3.notes):
+                return False        # 否决被塞进 notes = 第五节第三行
+            if "MU" not in rep3.render().split("[技术快照]")[0]:
+                return False        # 告警没印在最上方
+            state["veto"] = False
+
+            # (d) 算不出仓位：NO_TRADE 终态，**和否决分开**
+            state["w"] = None
+            k4 = _mk("SLB", .6)
+            r4 = pl2.advance("2026-09-04", portfolio_id="TEST")
+            if r4["no_position"] != 1 or r4["vetoed"]:
+                return False
+            if rq3.get(k4).state != rq3.NO_TRADE:
+                return False
+            if rq3.counts().get(rq3.NO_TRADE) != 1:
+                return False        # 走到这里就从计数里蒸发了
+            state["w"] = 0.04
+
+            # (e) 有目标却没落成提案：**必须喊**
+            k5 = _mk("NVDA", .95)
+            pp2.for_run = lambda **kw: {
+                "status": pp2.BOOK_NOT_OPEN, "note": "还没开账", "run_id": "",
+                "saved": [], "expired": [], "decisions": [], "rows": [],
+                "summary": {}, "compliance": {}, "expires": "", "nav": {},
+                "prices": {}, "price_detail": {}, "held": {}, "n_marked": 0,
+                "renders": {}}
+            rep5 = hbmod.Report("2026-09-04")
+            with rep5.stage("cro_pc") as hb5:
+                r5 = pl2.advance("2026-09-04", portfolio_id="TEST", hb=hb5)
+            if r5["targets"] != 1 or r5["proposals"]:
+                return False
+            if not any("提案没落成" in t for _l, t in rep5.alerts()):
+                return False
+            if rq3.get(k5).state != rq3.PC_COMPLETE:
+                return False        # 没走完却标成走完了
+
+            # (f) 预演不碰任何状态
+            k6 = _mk("META", .5)
+            r6 = pl2.advance("2026-09-04", portfolio_id="TEST", dry_run=True)
+            if rq3.get(k6).state != rq3.RESEARCHED or r6["pc_run_id"]:
+                return False
+            rq3.transition(k6, rq3.FAILED, "清场")   # 让下一段从空队列开始
+
+            # (g) **什么都没发生的那天，一盏灯都不许亮。**
+            # 上面 (a) 那次一切正常、propose_status="completed"，
+            # 所以它**测不到**"没目标的日子也点灯"这种常亮 ——
+            # 判别力在这里：0 条待处理、propose_status="no_targets"。
+            ps2.pending = lambda pid: []
+            for it0 in list(rq3.in_state(rq3.PENDING_APPROVAL)):
+                rq3.transition(it0.key, rq3.STALE, "清场")
+            rep7 = hbmod.Report("2026-09-04")
+            with rep7.stage("cro_pc") as hb7:
+                r7 = pl2.advance("2026-09-04", portfolio_id="TEST", hb=hb7)
+            if r7["picked"] or r7["targets"]:
+                return False
+            if rep7.alerts():
+                return False        # 常亮的灯 = 不亮的灯
+            if hb7.counts.get("picked") != 0 or "picked 0" not in rep7.render():
+                return False        # 0 不记 → "今天没有"和"今天没跑"分不开
+
+            # (h) **对不上要喊。** 队列说有一条待批，提案库说没有。
+            k8 = _mk("AVGO", .85)
+            pp2.for_run = lambda **kw: {
+                "status": pp2.COMPLETED, "note": "", "run_id": kw["run_id"],
+                "saved": [{"id": 77, "ticker": "AVGO", "action": "BUY",
+                           "state": ps2.PENDING_APPROVAL}],
+                "expired": [], "decisions": [], "rows": [], "summary": {},
+                "compliance": {}, "expires": "", "nav": {}, "prices": {},
+                "price_detail": {}, "held": {}, "n_marked": 0, "renders": {}}
+            ps2.pending = lambda pid: []          # 提案库那边少一条
+            rep8 = hbmod.Report("2026-09-04")
+            with rep8.stage("cro_pc") as hb8:
+                r8 = pl2.advance("2026-09-04", portfolio_id="TEST", hb=hb8)
+            if r8["reconcile"]["ok"]:
+                return False
+            if not any("对不上" in t for _l, t in rep8.alerts()):
+                return False
+            if rq3.get(k8).state == rq3.PENDING_APPROVAL:
+                rq3.transition(k8, rq3.STALE, "清场")
+
+            # (i) **一次 advance = 一次 PC 运行**，不是逐票各领一个
+            seen = []
+            pl2._record = lambda item, cro, sz: seen.append(pl2._RUN["id"])
+            ka, kb = _mk("TSLA", .9), _mk("INTC", .8)
+            ps2.pending = lambda pid: [{"id": 77}]
+            r9 = pl2.advance("2026-09-04", portfolio_id="TEST")
+            if len(seen) != 2 or len(set(seen)) != 1:
+                return False        # 拆开的话 --run-id 只提案得了其中一只
+            if seen[0] != r9["pc_run_id"]:
+                return False
+            for kk in (ka, kb):
+                if rq3.get(kk).state == rq3.PENDING_APPROVAL:
+                    rq3.transition(kk, rq3.STALE, "清场")
+    finally:
+        rq3.QUEUE_PATH = old_q
+        pp2.for_run, ps2.pending = real_prop, real_pending
+        pl2._record, pl2._thesis_for = real_rec, real_th
+        ci2.measures_for, ro2.assess_one, sz2.size_one, rg2.assess = keep
+
+    # ---- 说不出原因的告警不许存在 ----
+    st = hbmod.Stage("cro_pc", "风控与仓位")
+    for empty in ("", "   ", None):
+        try:
+            st.alert(empty)
+            return False        # 空告警被收下 = 把人叫去查一个不存在的问题
+        except ValueError:
+            pass
+
+    # ---- 先序列化，后落库（这条纪律住在库里，不住在某一个入口里）----
+    seen2 = {}
+    real_ps_record, real_expire = ps2.record, ps2.expire_stale
+    import cio.book as bk2
+    import cio.compliance as cp2
+    import cio.marks as mk2
+    import cio.pc_ledger as pcl2
+    import cio.rebalance as rb2
+    keep2 = (bk2.is_book_portfolio, bk2.assert_single_source, bk2.holdings_map,
+             bk2.nav, bk2.portfolio_row, bk2.render, bk2.mark_evaluated,
+             mk2.close_prices, mk2.render_note, pcl2.latest_run_id,
+             pcl2.decisions_for_run, cp2.check_proforma, cp2.render, rb2.render)
+    try:
+        bk2.is_book_portfolio = lambda pid: True
+        bk2.assert_single_source = lambda pid: None
+        bk2.holdings_map = lambda pid: {}
+        bk2.nav = lambda pid, px: {"nav": 100000.0, "cash": 100000.0}
+        bk2.portfolio_row = lambda pid: {"lot_size": 1}
+        bk2.render = lambda pid, px=None: ""
+        bk2.mark_evaluated = lambda *a, **k: 0
+        mk2.close_prices = lambda ts: {t: {"price": 100.0} for t in ts}
+        mk2.render_note = lambda d: ""
+        pcl2.latest_run_id = lambda pid: "pc-x"
+        pcl2.decisions_for_run = lambda rid, pid="": [
+            {"ticker": "AMD", "veto": 0, "w_final": 0.04}]
+        cp2.check_proforma = lambda **kw: {"status": "PASS", "n_total": 1,
+                                           "n_not_evaluated": 0}
+        cp2.render = lambda c: ""
+        rb2.render = lambda p: ""
+        ps2.expire_stale = lambda pid, d, actor="": []
+        ps2.record = lambda **kw: seen2.__setitem__(
+            "n", seen2.get("n", 0) + 1) or {"id": 1, "ticker": "AMD",
+                                            "state": "NO_TRADE"}
+
+        def _boom(o):
+            seen2["rows_at_hook"] = len(o["rows"])
+            seen2["recorded_at_hook"] = seen2.get("n", 0)
+            raise RuntimeError("序列化炸了")
+        try:
+            pp2.for_run(portfolio_id="TEST", as_of="2026-09-04",
+                        before_record=_boom)
+            return False            # 钩子抛了异常却正常返回
+        except RuntimeError:
+            pass
+        if not seen2.get("rows_at_hook"):
+            return False            # 钩子被调用时指令清单还没算出来
+        if seen2.get("recorded_at_hook") != 0 or seen2.get("n", 0) != 0:
+            return False            # 顺序反了 → 重试会写出两条一样的提案
+    finally:
+        ps2.record, ps2.expire_stale = real_ps_record, real_expire
+        (bk2.is_book_portfolio, bk2.assert_single_source, bk2.holdings_map,
+         bk2.nav, bk2.portfolio_row, bk2.render, bk2.mark_evaluated,
+         mk2.close_prices, mk2.render_note, pcl2.latest_run_id,
+         pcl2.decisions_for_run, cp2.check_proforma, cp2.render,
+         rb2.render) = keep2
+
+    # ---- 跃迁可写字段有白名单 ----
+    old_q2 = rq3.QUEUE_PATH
+    try:
+        with tempfile.TemporaryDirectory() as td2:
+            rq3.QUEUE_PATH = Path(td2) / "q.jsonl"
+            for t in rt3.route([tg3.technical_trigger(
+                    "AMD", "2026-09-04", "2026-09-04", lin, score=.9)]):
+                rq3.enqueue(t)
+            kk = list(rq3.items().values())[0].key
+            rq3.transition(kk, rq3.ENRICHING, "t", fields={"proposal_id": 3})
+            if rq3.get(kk).proposal_id != 3:
+                return False
+            try:
+                rq3.transition(kk, rq3.RESEARCHING, "t", fields={"priority": 999})
+                return False        # 非白名单字段被写进去了
+            except ValueError:
+                pass
+    finally:
+        rq3.QUEUE_PATH = old_q2
+
+    # ---- 四、两份共用实现，不许各写各的 ----
+    rb_src = (root / "run_rebalance.py").read_text("utf-8")
+    if "propose.for_run" not in rb_src or "proposal_store.record(" in rb_src:
+        return False
+    pc_src = (root / "run_pc.py").read_text("utf-8")
+    fn = next((n for n in ast.walk(ast.parse(pc_src))
+               if isinstance(n, ast.FunctionDef) and n.name == "_measures_for"), None)
+    if fn is None:
+        return False
+    body = ast.get_source_segment(pc_src, fn) or ""
+    if "cro_inputs.measures_for" not in body:
+        return False
+    if any(b in body for b in ("ann_vol", "beta_corr", "max_drawdown")):
+        return False
+    pl_src = (root / "src" / "cio" / "research" / "pipeline.py").read_text("utf-8")
+    if "cro_inputs.measures_for" not in pl_src or "propose.for_run" not in pl_src:
+        return False
+    return True
+
+
+def _b120_two_entrances_one_queue():
+    """**Evidence Gate 不许拦 Technical Trigger，否则技术入口静默死亡。**
+
+    写成 `TECHNICAL → run_scan → INSUFFICIENT → STOP`：队列照跑、简报照发、
+    日志全绿，而那条路上永远出不来一个名字 —— 和盘前简报失踪三天同一个形状。
+
+    Build 2 的其余不变量：一次事件一个任务（不是一天一个）、两条入口合并成
+    一个任务、优先级说得出来历、非法跃迁抛异常、CRO 否决 ≠ CEO 否决、
+    失败不消失也不无限重试。
+    """
+    import ast
+    import tempfile
+    from cio.research import queue as rq
+    from cio.research import router as rt
+    from cio.research import trigger as tg
+
+    lin = {"setup_version": "setup-1.0.1", "score_version": "score-2.1.0"}
+
+    # 一、INSUFFICIENT 不许拦住技术入口
+    t = tg.technical_trigger("AMD", "2026-09-04", "2026-09-04", lin, score=0.87)
+    if t.evidence_gate != "":
+        return False               # 技术 trigger 自带了 evidence 判定
+    t.evidence_gate = "INSUFFICIENT"
+    tasks = rt.route([t])
+    if len(tasks) != 1 or tasks[0].symbol != "AMD":
+        return False
+    rsrc = (Path(__file__).resolve().parents[1] / "src" / "cio" / "research"
+            / "router.py").read_text("utf-8")
+    for fname in ("merge", "route", "dedupe"):
+        node = next((n for n in ast.walk(ast.parse(rsrc))
+                     if isinstance(n, ast.FunctionDef) and n.name == fname), None)
+        if node is None:
+            return False
+        if "evidence_gate" in (ast.get_source_segment(rsrc, node) or ""):
+            return False           # 路由在按 evidence 过滤 = 当成了拦截器
+
+    # 二、一次事件一个任务；换 setup 版本就不是同一件事
+    days = [f"2026-09-{d:02d}" for d in (4, 7, 8, 9, 10)]
+    ts = [tg.technical_trigger("AMD", d, "2026-09-04", lin, score=0.8) for d in days]
+    if len({x.event_id for x in ts}) != 1 or len(rt.route(ts)) != 1:
+        return False
+    # **event_id 真的跟着起始日走**（同一次运行里 today 也是同一个值，
+    # 只用同一个 start 的夹具分不出"按起始日"和"按今天"）
+    if tg.make_event_id("AMD", "2026-09-04", lin) == tg.make_event_id(
+            "AMD", "2026-08-01", lin):
+        return False
+    if tg.make_event_id("AMD", "2026-09-04", lin) == tg.make_event_id(
+            "MU", "2026-09-04", lin):
+        return False
+    other = tg.technical_trigger("AMD", "2026-09-04", "2026-09-04",
+                                 dict(lin, setup_version="setup-1.1.0"), score=0.8)
+    if other.event_id == ts[0].event_id:
+        return False
+
+    # 三、两条入口合并成一个任务，加成单独记
+    ev = tg.evidence_trigger("AMD", "2026-09-04", "SUFFICIENT")
+    merged = rt.route([ts[0], ev])
+    if len(merged) != 1 or not merged[0].both_entrances:
+        return False
+    if merged[0].priority_parts.get(rt.P_BOTH) != tg.BOTH_ENTRANCES_BONUS:
+        return False
+    if merged[0].priority != sum(merged[0].priority_parts.values()):
+        return False
+
+    # 四、优先级说得出来历；没分数就是 0 不是 50
+    try:
+        bad = tg.technical_trigger("X", "2026-09-04", "2026-09-04", lin, score=0.5)
+        bad.priority = 999
+        tg.check_priority_adds_up(bad)
+        return False
+    except ValueError:
+        pass
+    if tg.technical_trigger("X", "2026-09-04", "2026-09-04",
+                            lin, score=None).priority != 0:
+        return False
+
+    # 五、老化有上限（防饿死不该变成另一种饿死）
+    low = tg.technical_trigger("OLD", "2026-09-01", "2026-09-01", lin, score=0.40)
+    high = tg.technical_trigger("NEW", "2026-09-11", "2026-09-11", lin, score=0.55)
+    if rt.route([low, high])[0].symbol != "NEW":
+        return False
+    if rt.route([low, high], ages={"OLD": 8})[0].symbol != "OLD":
+        return False
+    capped = rt.route([low, high], ages={"OLD": 999})[0]
+    if capped.priority_parts.get(rt.P_AGE) != rt.AGE_CAP_DAYS * rt.AGE_POINTS_PER_DAY:
+        return False
+
+    # 六、状态机
+    if rq.REJECTED in rq.LEGAL[rq.RISK_REVIEW]:
+        return False               # CRO 用了 CEO 那个否决，两道闸会混成一个数
+    if rq.VETOED not in rq.LEGAL[rq.RISK_REVIEW]:
+        return False
+    if rq.VETOED in rq.LEGAL[rq.PENDING_APPROVAL]:
+        return False
+    if rq.LEGAL[rq.VETOED] or rq.LEGAL[rq.EXECUTED]:
+        return False               # 终态有出边
+
+    old_path = rq.QUEUE_PATH
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            rq.QUEUE_PATH = Path(td) / "q.jsonl"
+            it, act = rq.enqueue(merged[0])
+            if act != "queued":
+                return False
+            if [rq.enqueue(merged[0])[1] for _ in range(2)] != ["exists", "exists"]:
+                return False       # 幂等坏了，队列会凭空变长
+            if len(rq.items()) != 1:
+                return False
+            try:
+                rq.transition(it.key, rq.APPROVED)
+                return False       # 非法跃迁被静默接受
+            except ValueError:
+                pass
+            # 失败不消失，也不无限重试
+            for _i in range(rq.MAX_ATTEMPTS):
+                rq.transition(it.key, rq.ENRICHING)
+                rq.transition(it.key, rq.FAILED, "超时")
+                if rq.get(it.key).attempts < rq.MAX_ATTEMPTS:
+                    rq.retry(it.key)
+            if rq.retry(it.key).state != rq.STALE:
+                return False
+            if rq.get(it.key) is None:
+                return False       # 它消失了
+            box = rq.counts()
+            if set(box) != set(rq.STATES) or box.get(rq.EXECUTED) != 0:
+                return False       # 0 不在字典里，心跳就报不出来
+    finally:
+        rq.QUEUE_PATH = old_path
+
+    # 七、两节接进同一份心跳
+    snap = (Path(__file__).resolve().parent / "technical_snapshot.py").read_text("utf-8")
+    tree = ast.parse(snap)
+    mfn = next((n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name == "main"), None)
+    mbody = ast.get_source_segment(snap, mfn) if mfn else ""
+    for need in ('rep.stage("research_router")', 'rep.stage("research_queue")',
+                 "unit_a", "cro_pc", "ceo"):
+        if need not in mbody:
+            return False
+    # **真的跑一遍，看计数有没有落进心跳。**
+    # 断 `"hb.count(" in 函数体` 不够：`_route_technical` 里有两处 hb.count，
+    # 删掉第一处照样绿 —— 子串从另一个调用被满足了。
+    import importlib.util
+    from cio import heartbeat as hbmod
+    from cio.technical import score as sc2
+    spec = importlib.util.spec_from_file_location(
+        "ts_probe", Path(__file__).resolve().parent / "technical_snapshot.py")
+    ts_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ts_mod)
+    ranked = [sc2.Ranked(symbol="AMD", as_of="2026-09-04", passed_gate=True,
+                         score=0.87, band="HIGH", families_used=5,
+                         families_possible=5, rank=1, within_budget=True),
+              sc2.Ranked(symbol="ZZZ", as_of="2026-09-04", passed_gate=False)]
+    old_q = rq.QUEUE_PATH
+    try:
+        with tempfile.TemporaryDirectory() as td2:
+            rq.QUEUE_PATH = Path(td2) / "q.jsonl"
+            ts_mod.rq.QUEUE_PATH = rq.QUEUE_PATH
+            rep = hbmod.Report("2026-09-04")
+            with rep.stage("research_router") as hb1:
+                tasks2 = ts_mod._route_technical(ranked, hb1)
+            if hb1.counts.get("raw_triggers") != 1:
+                return False
+            if hb1.counts.get("unique_symbols") != 1:
+                return False
+            if "both_entrances" not in hb1.counts:
+                return False
+            with rep.stage("research_queue") as hb2:
+                ts_mod._fill_queue(tasks2, hb2)
+            if hb2.counts.get("queued") != 1 or hb2.counts.get("open_items") != 1:
+                return False
+            if "raw_triggers 1" not in rep.render():
+                return False
+    finally:
+        rq.QUEUE_PATH = old_q
+    return True
+
+
+def _b119_heartbeat_tells_nothing_apart_from_never_ran():
+    """**"今天没有"和"今天没跑"必须长得不一样。**
+
+    盘前简报静默失踪三天：日志里每天一行"跳过"，磁盘上、收件箱里什么都没有——
+    而"什么都没有"同时是两件事的样子。
+
+    Build 1 的产物是一份**声明式**的流水线报告：阶段事先声明，没跑到的
+    印"未运行"，0 也印，每天落盘一份——**有没有那份文件就是那天跑没跑的答案。**
+    """
+    import ast
+    import datetime as dt
+    import tempfile
+    from cio import heartbeat as hb
+
+    # 声明过的阶段，没跑也要出现
+    rep = hb.Report("2026-09-04")
+    with rep.stage("technical_snapshot") as st:
+        st.count(scanned=502, gate_passed=0)
+    text = rep.render()
+    # **每个阶段要有自己那一行**（底部那句"未运行的阶段"汇总里也有标签,
+    # 只断 `label in text` 会被那条路径满足）
+    for _k, label in hb.PIPELINE:
+        if f"[{label}]" not in text:
+            return False
+    if "未运行" not in text or "gate_passed 0" not in text:
+        return False               # 0 被印成了空白
+    try:
+        rep.stage("未声明的阶段")
+        return False               # 临时阶段被收下 = 它不跑时不会出现在报告里
+    except KeyError:
+        pass
+
+    # 失败被记录、不拖垮别的、进退出码
+    rep2 = hb.Report("2026-09-04")
+    with rep2.stage("technical_snapshot"):
+        raise RuntimeError("取数全挂")
+    with rep2.stage("research_router") as st2:
+        st2.count(triggers=1)
+    if rep2.stages["technical_snapshot"].status != hb.FAILED:
+        return False
+    if rep2.stages["research_router"].status != hb.OK or rep2.exit_code() != 1:
+        return False
+
+    # 跳过要理由，且不算失败
+    rep3 = hb.Report("2026-09-04")
+    with rep3.stage("technical_snapshot") as st3:
+        try:
+            st3.skip("")
+            return False
+        except ValueError:
+            pass
+        st3.skip("周末")
+    if rep3.exit_code() != 0 or rep3.stages["technical_snapshot"].status != hb.SKIPPED:
+        return False
+
+    # 落盘 + 缺失日 = 那天没跑
+    old_dir = hb.REPORT_DIR
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            hb.REPORT_DIR = Path(td)
+            today = dt.date.today()
+            r = hb.Report(today.isoformat())
+            with r.stage("technical_snapshot") as st4:
+                st4.count(scanned=0)
+            r.save()
+            if hb.dates() != [today.isoformat()]:
+                return False
+            if today.isoformat() in hb.missing_days(back=5):
+                return False
+            (Path(td) / "notes.json").write_text("{}", "utf-8")
+            if hb.dates() != [today.isoformat()]:
+                return False       # 非日期文件被当成了一天
+            hit = False
+            for i in range(1, 8):
+                d = today - dt.timedelta(days=i)
+                if d.weekday() in (0, 1, 2, 3, 4):
+                    hit = d.isoformat() in hb.missing_days(back=9)
+                    break
+            if not hit:
+                return False
+    finally:
+        hb.REPORT_DIR = old_dir
+
+    # 快照：心跳必须建在闸门之前，跳过也要落一份报告
+    snap = (Path(__file__).resolve().parent / "technical_snapshot.py").read_text("utf-8")
+    tree = ast.parse(snap)
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name == "main"), None)
+    if fn is None:
+        return False
+    body = ast.get_source_segment(snap, fn) or ""
+    if body.index("heartbeat.Report(") > body.index("is_snapshot_time()"):
+        return False               # 跳过的那天不会留下报告
+    for need in ("hb.skip(", "rep.save()", "rep.push()"):
+        if need not in body:
+            return False
+    sb = next((n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name == "_snapshot_body"), None)
+    sbody = ast.get_source_segment(snap, sb) if sb else ""
+    seg = sbody[sbody.index("if not cards:"):][:500] if sbody else ""
+    if "raise" not in seg or "hb.count(" not in seg:
+        return False               # 一张卡都没出却只是 return
+
+    # 收盘定时脚本存在，且不写死小时数
+    ish = (Path(__file__).resolve().parent / "install_snapshot_launchd.sh")
+    if not ish.exists():
+        return False
+    ish_src = ish.read_text("utf-8")
+    for need in ("SNAPSHOT_WINDOW", "CIO_SNAPSHOT_ALLOW_ANY_HOUR", "拒绝安装"):
+        if need not in ish_src:
+            return False
+    # **小时数是算出来的,不是写死的。** 判别力靠把时区掰到上海:
+    # 那里收盘窗口是 04:30–11:59,默认应当是 6,而写死的 18 会被拒。
+    import re as _re
+    if _re.search(r'HOUR="\$\{CIO_SNAPSHOT_HOUR:-\d+\}"', ish_src):
+        return False
+    if "DEFAULT_H" not in ish_src:
+        return False
+
+    # 夏令时警告只在成立时才印
+    #
+    # **哪个时区算"对齐"由市场决定，不能写死纽约。** 写死的话，
+    # `CIO_MARKET=cn`（check_build 的默认）下这两句正好反过来 ——
+    # 探针测的就不再是"警告有没有条件"，而是"市场是不是美国"。
+    # 这条探针在 build118/119 交付时是绿的，只因为当时那台机器恰好是美东：
+    # **又一次夹具没有判别力**，只是这回它把正确实现判成了错的。
+    import datetime as _dt
+    from zoneinfo import ZoneInfo as _ZI
+    from cio import schedule as sc
+    aligned_tz = str(sc.market().get("tz") or "Asia/Shanghai")
+    _off = _dt.datetime.now(_ZI(aligned_tz)).utcoffset()
+    other_tz = next((z for z in ("UTC", "Asia/Shanghai", "America/New_York",
+                                 "Asia/Kolkata", "Pacific/Kiritimati")
+                     if _dt.datetime.now(_ZI(z)).utcoffset() != _off), None)
+    if other_tz is None:
+        return False
+    same = "\n".join(sc.cron_hint(aligned_tz))
+    diff = "\n".join(sc.cron_hint(other_tz))
+    return ("不用手动改" in same and "要手动改" in diff
+            and "不用手动改" not in diff)
+
+
+def _b118_review_records_when_the_judgement_was_made():
+    """**"63% 值得研究"这句话，别人一定会问"你什么时候判的"。**
+
+    判断做在信号当天、还看不见后续走势时，和几天后回头补判，
+    是两种完全不同的证据 —— 而在这条记录之前，它们在台账里长得一模一样。
+
+    五条（她定的规格，只碰台账，不碰筛选逻辑）：
+    reviewed_at 自动填市场时区 / 延迟按交易日 / clean·t1·retrospective 分开 /
+    excluded 独立且不进分母 / 同判定重复 mark 幂等。
+    """
+    import json
+    import tempfile
+    from cio.technical import review as rv
+
+    old_p, old_l = rv.REVIEW_PATH, rv.LEGACY_REVIEW_PATH
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            rv.REVIEW_PATH = Path(td) / "reviews.jsonl"
+            rv.LEGACY_REVIEW_PATH = Path(td) / "none.jsonl"
+
+            r = rv.mark("2026-09-04", "A", "worth", "理由")
+            if r.get("action") != "written" or not r.get("reviewed_at"):
+                return False
+            # 带偏移量的 ISO，且**不是机器本地时间**（跟市场时区走）
+            stamp = r["reviewed_at"]
+            if "T" not in stamp or not ("+" in stamp[10:] or "-" in stamp[10:]):
+                return False
+            # **把机器时区掰到和市场不一样才有判别力**：机器时区就是市场时区
+            # 的时候，"用机器时间"和"用市场时间"两种实现给出同一个偏移量。
+            #
+            # 掰去哪儿**不能写死**。写死 Asia/Shanghai，`CIO_MARKET=cn` 下
+            # 市场时区本来就是 +08:00 —— 那句"不等于 +08:00"会把正确实现判成
+            # 错的，而且更糟：那种情形下它对"跟着机器走"根本没有判别力。
+            # 所以挑一个**此刻偏移量和市场不同**的时区，并且和机器实际偏移量
+            # 比，而不是和一个写死的字符串比。
+            import datetime as _dt
+            import os as _os
+            import time as _time
+            from zoneinfo import ZoneInfo as _ZI
+            from cio.schedule import market_now
+            _mkt_off = market_now().utcoffset()
+            _other = next((z for z in ("UTC", "Asia/Shanghai",
+                                       "America/New_York", "Asia/Kolkata",
+                                       "Pacific/Kiritimati")
+                           if _dt.datetime.now(_ZI(z)).utcoffset() != _mkt_off),
+                          None)
+            if _other is None:
+                return False
+            _keep = _os.environ.get("TZ")
+            try:
+                _os.environ["TZ"] = _other
+                if hasattr(_time, "tzset"):
+                    _time.tzset()
+                    _machine = _dt.datetime.now().astimezone().isoformat()[-6:]
+                    if rv.market_stamp()[-6:] != market_now().isoformat()[-6:]:
+                        return False
+                    if rv.market_stamp()[-6:] == _machine:
+                        return False       # 跟着机器时区走了
+            finally:
+                if _keep is None:
+                    _os.environ.pop("TZ", None)
+                else:
+                    _os.environ["TZ"] = _keep
+                if hasattr(_time, "tzset"):
+                    _time.tzset()
+
+            # 交易日，不是日历天：周五 → 周一 是 1
+            if rv.trading_days_between("2026-09-04", "2026-09-07T06:00:00-04:00") != 1:
+                return False
+            if rv.trading_days_between("2026-09-04", "2026-09-04T20:00:00-04:00") != 0:
+                return False
+            if rv.trading_days_between("2026-09-04", "2026-09-01T09:00:00-04:00") is not None:
+                return False               # 复核早于信号，不猜
+
+            # 同判定不写第二行
+            n0 = len(rv.REVIEW_PATH.read_text("utf-8").splitlines())
+            if rv.mark("2026-09-04", "A", "worth", "再来")["action"] != "unchanged":
+                return False
+            if len(rv.REVIEW_PATH.read_text("utf-8").splitlines()) != n0:
+                return False
+            rev = rv.mark("2026-09-04", "A", "skip", "改主意")
+            if rev.get("action") != "revised" or rev.get("previous_verdict") != "worth":
+                return False
+
+            # excluded 要理由，且不进分母
+            try:
+                rv.mark("2026-09-01", "E", "excluded", "")
+                return False
+            except ValueError:
+                pass
+            rv.mark("2026-09-01", "E", "excluded", rv.RETROSPECTIVE_CONTAMINATION)
+            rv.mark("2026-09-03", "F", "worth", "隔天",
+                    reviewed_at="2026-09-04T09:00:00-04:00")
+
+            by_lag = rv.stats()["by_lag"][rv.SETUP_VERSION]
+            if by_lag["t1"]["worth"] != 1:
+                return False
+            if by_lag["retrospective"]["excluded"] != 1:
+                return False
+            if rv.worth_rate(by_lag["retrospective"]) != (None, 0):
+                return False               # excluded 进了分母
+            if rv.worth_rate({"worth": 0, "skip": 0, "unclear": 0}) != (None, 0):
+                return False               # 没样本被说成 0%
+
+            # 老记录没有时间戳 → unknown，**不许并进 clean**
+            rows = [json.loads(x) for x in
+                    rv.REVIEW_PATH.read_text("utf-8").splitlines() if x.strip()]
+            before = rv.stats()["by_lag"][rv.SETUP_VERSION]["clean"]["worth"]
+            rows.append({"as_of": "2026-08-20", "symbol": "OLD", "verdict": "worth",
+                         "note": "老台账", "setup_id": rv.SETUP_ID,
+                         "setup_version": rv.SETUP_VERSION, "reviewed_at": ""})
+            rv.REVIEW_PATH.write_text(
+                "\n".join(json.dumps(x, ensure_ascii=False) for x in rows) + "\n",
+                "utf-8")
+            after = rv.stats()["by_lag"][rv.SETUP_VERSION]
+            if after["unknown"]["worth"] != 1 or after["clean"]["worth"] != before:
+                return False
+
+            # excluded 之后离开待复核队列
+            if ("2026-09-01", "E") in rv.pending([("2026-09-01", "E")]):
+                return False
+    finally:
+        rv.REVIEW_PATH, rv.LEGACY_REVIEW_PATH = old_p, old_l
+
+    # CLI：主 KPI 只印 clean 那一档，且 --on 的日期不许掉进理由里
+    # **断结构，不断子串。** `"_print_kpi" in snap` 会被它自己的 def 满足，
+    # 把调用点删掉照样绿 —— 变异测试第一轮就是这样漏的。
+    import ast as _ast
+    snap = (Path(__file__).resolve().parent / "technical_snapshot.py").read_text("utf-8")
+    tree = _ast.parse(snap)
+    fn = next((n for n in _ast.walk(tree)
+               if isinstance(n, _ast.FunctionDef) and n.name == "_review"), None)
+    if fn is None:
+        return False
+    called = {n.func.id for n in _ast.walk(fn)
+              if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Name)}
+    if "_print_kpi" not in called:
+        return False                       # 分桶统计没人调 = 没做
+    kpi = next((n for n in _ast.walk(tree)
+                if isinstance(n, _ast.FunctionDef) and n.name == "_print_kpi"), None)
+    if kpi is None or "主 KPI" not in (_ast.get_source_segment(snap, kpi) or ""):
+        return False
+    # --on 的日期不许掉进理由里：那段解析必须真的跳过它的参数
+    mk = next((n for n in _ast.walk(tree)
+               if isinstance(n, _ast.FunctionDef) and n.name == "_mark"), None)
+    body = _ast.get_source_segment(snap, mk) if mk else ""
+    return bool(body) and 'a == "--on"' in body and "k += 2" in body
+
+
+def _b117_out_of_window_brief_cannot_look_normal():
+    """**绕过时间闸是允许的，隐瞒绕过不允许。**
+
+    2026-09-01 那份 19:49 的简报，要害不是"发错了时间"，是
+    **发错时间的那份和发对时间的长得一模一样**。
+
+    我对病因的诊断（"机器在北京时区"）后来被 `date` 否掉了，
+    真正的原因至今未知。所以这条探针钉的**不是病因，是结果**：
+    窗口外产出必须在三条路上都留下标记，`--doctor` 必须能读机器上真正装着的排程。
+    """
+    import ast
+    import importlib.util
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location("rp_probe", root / "run_premarket.py")
+    rp = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rp)
+
+    if "窗口外" in rp.archive_base("2026-09-04-0700", False):
+        return False
+    if "窗口外" not in rp.archive_base("2026-09-04-1949", True):
+        return False
+
+    class _S:
+        fetched = 1
+        deduped = 0
+        ingested_vectors = 0
+
+    class _B:
+        bluf = ["x"]
+        fund_flows: list = []
+        watchlist_hits: list = []
+        status = _S()
+        dt_ny = "2026-09-01 19:49 EDT"
+        dt_beijing = "2026-09-02 07:49"
+
+    b = _B()
+    if rp.OUT_OF_WINDOW_MARK in rp._summary_text(b, False):
+        return False
+    forced = rp._summary_text(b, True)
+    if rp.OUT_OF_WINDOW_MARK not in forced.splitlines()[0]:
+        return False
+    if "不是在盘前窗口内产出的" not in forced:
+        return False
+
+    src = (root / "run_premarket.py").read_text("utf-8")
+    # **caption 上必须拼上同一个标记。**
+    # 上一版这里写的是 `"mark" in src[i:i+120]` —— 而紧邻的 `_market_stamp`
+    # 里就含有 "mark" 这四个字母，所以把 {mark} 删掉它照样是绿的。
+    # **断结构，不要断文本**：走 AST，要求 caption 那个 f-string 里
+    # 确实引用了名为 mark 的变量。
+    tree = ast.parse(src)
+    cap = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.keyword) and node.arg == "caption":
+            cap = node.value
+    if cap is None:
+        return False
+    names = {n.id for n in ast.walk(cap) if isinstance(n, ast.Name)}
+    if "mark" not in names:
+        return False
+
+    # **`_out_of_window` 必须同时看 forced 和 in_window。**
+    # 写死成 False 会让上面所有标记全部失效，而每一条断言都还是绿的
+    # （它们都是直接传 True 进去测的）。
+    assigns = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
+               and any(getattr(t, "id", "") == "_out_of_window" for t in n.targets)]
+    if not assigns:
+        return False
+    for a in assigns:
+        used = {n.id for n in ast.walk(a.value) if isinstance(n, ast.Name)}
+        if not ({"forced", "in_window"} <= used):
+            return False
+
+    # --doctor 只读本机状态，不发请求
+    if not hasattr(rp, "doctor"):
+        return False
+    fn = next((n for n in ast.walk(ast.parse(src))
+               if isinstance(n, ast.FunctionDef) and n.name == "doctor"), None)
+    if fn is None:
+        return False
+    body = ast.get_source_segment(src, fn) or ""
+    if any(x in body for x in ("collect_premarket", "deliver_brief", "httpx", "requests")):
+        return False
+
+    # **doctor 断的是它印出来的东西，不是源码里有没有那几个字。**
+    # 第一版我 grep 函数体，而同样的字在模块注释里也有，变异照样绿。
+    import os
+    import plistlib
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        (home / "Library" / "LaunchAgents").mkdir(parents=True)
+        (home / "Library" / "LaunchAgents"
+         / "com.crystal.cio.premarket.plist").write_bytes(plistlib.dumps({
+             "Label": "com.crystal.cio.premarket",
+             "ProgramArguments": ["/x/.venv/bin/python", "/x/run_premarket.py"],
+             "StartCalendarInterval": [{"Hour": 19, "Minute": 30}]}))
+        env = dict(os.environ, HOME=str(home), CIO_MARKET="us",
+                   TZ="America/New_York")
+        # **自己按 UTF-8 解码，不交给 locale。** `text=True` 用的是
+        # `locale.getpreferredencoding()`，机器 locale 不是 UTF-8 时，
+        # 同一段中文输出在一台机器上能读、在另一台上抛 UnicodeDecodeError——
+        # **一个解码问题会伪装成逻辑失败**（她机器上 2026-09-05 就是这样）。
+        r = subprocess.run([sys.executable, str(root / "run_premarket.py"), "--doctor"],
+                           capture_output=True, env=env, timeout=180)
+    out = (r.stdout or b"").decode("utf-8", "replace")
+    for need in ("19:30", "没有 Weekday", "对不上", "什么都不发", "install_launchd.sh"):
+        if need not in out:
+            return False
+
+    # 时区参数传错要说清是谁传错了什么（不是 ZoneInfo 内部那句症状报错）
+    from cio import schedule as sc
+    try:
+        sc.local_window(sc.PREMARKET_WINDOW)
+        return False
+    except TypeError as e:
+        m = str(e)
+        if "machine_tz" not in m or "dict" not in m or "unhashable" in m:
+            return False
+    except Exception:                                          # noqa: BLE001
+        return False
+    try:
+        sc.local_window("Nowhere/Nothing")
+        return False
+    except ValueError:
+        pass
+    except Exception:                                          # noqa: BLE001
+        return False
+    return sc.local_window(None) == sc.local_window("")
+
+
+def _b115_semantics_change_moves_the_schema_version():
+    """**改字段含义必须升 `schema_version` —— 我在自己的代码上违反了这条。**
+
+    build114 改了 `align()`，`rs_mkt_samples` 同一份输入给出不同的数
+    （405 → 404），说的东西也从"对齐了几天"变成"几天能用"。**语义变了。**
+    我没升版本，于是她的 `2026-09-04.jsonl` 被三个版本的代码各写过一遍，
+    三次都盖同一个章——**内容不同，图章相同**，`version_drift()` 会说"全是同一版"。
+
+    语义变了没法自动检测，**字段集变了可以**——所以有一条字段名指纹。
+    它红了不是让你改常量，是让你回答：这次要不要升版本。
+    """
+    import pandas as pd
+    from cio.technical import SCHEMA_VERSION
+    from cio.technical import observer as tob
+
+    if SCHEMA_VERSION != "signal-card-1.1.0":
+        return False
+    isrc = (Path(__file__).resolve().parents[1] / "src" / "cio" / "technical"
+            / "__init__.py").read_text("utf-8")
+    if "1.0.0 → 1.1.0" not in isrc or "rs_mkt_samples" not in isrc:
+        return False
+
+    # 指纹只跟字段名走，不跟这张卡片算出了什么走（否则它每天都红 = 等于没有）
+    fps = set()
+    for nrow, wb in ((405, True), (300, True), (60, False)):
+        dd = pd.bdate_range(start="2024-01-01", periods=nrow)
+        cc = [100 + 0.05 * i for i in range(nrow)]
+        bb = (pd.DataFrame({"date": dd,
+                            "close": [100 * (1.0002 ** i) for i in range(nrow)]})
+              if wb else None)
+        card = tob.observe(pd.DataFrame({
+            "date": dd, "open": cc, "high": [x + 0.5 for x in cc],
+            "low": [x - 0.5 for x in cc], "close": cc,
+            "volume": [1e6 + 3e5 * (i % 7) for i in range(nrow)]}),
+            bench=bb, sector_bench=bb, symbol="F",
+            sector_symbol="XLK" if wb else "")
+        fps.add(tob.card_fields_fingerprint(card))
+    if len(fps) != 1:
+        return False
+    if fps.pop() != tob.FROZEN_FIELDS_FINGERPRINT:
+        return False
+
+    # 扫描的收尾那句必须真的印在最后
+    swsrc = (Path(__file__).resolve().parents[1] / "src" / "cio" / "technical"
+             / "sweep.py").read_text("utf-8")
+    if "def closing_line" not in swsrc:
+        return False
+    snap = (Path(__file__).resolve().parent / "technical_snapshot.py").read_text("utf-8")
+    if "sweep.closing_line()" not in snap:
+        return False
+    if snap.index("benchmark_last_note") > snap.index("sweep.closing_line()"):
+        return False                       # 收尾句印在了基准那几行前面
+
+    # **模块文档里不许留着那个错的诊断当立论**
+    if "板块基准是好的，大盘基准是短的" in swsrc:
+        return False
+    return "最后一根收盘价是 NaN" in swsrc
+
+
+def _b114_ledger_is_not_a_trading_day():
+    """**`已存日期 ['2026-09-01', '2026-09-04', 'reviews']`** —— 真实输出。
+
+    人工复核台账和卡片存在同一个目录，`dates()` 是 `glob("*.jsonl")` 取文件名，
+    于是台账变成了一个交易日。`events()` / `version_drift()` / `hit_series()`
+    全都遍历 `dates()`——**台账的行一直在被当作信号卡片读。**
+
+    今天没出事，只因为台账的行里没有 `symbol`、恰好被跳过。
+    """
+    import tempfile
+    from cio.technical import review, store
+
+    if review.REVIEW_PATH.parent == store.CARD_DIR:
+        return False                       # 污染源还在卡片目录里
+
+    with tempfile.TemporaryDirectory() as td:
+        card_dir = Path(td) / "technical_cards"
+        card_dir.mkdir(parents=True)
+        old_card, old_rev = store.CARD_DIR, review.REVIEW_PATH
+        old_legacy = review.LEGACY_REVIEW_PATH
+        try:
+            store.CARD_DIR = card_dir
+            review.REVIEW_PATH = Path(td) / "technical_reviews" / "reviews.jsonl"
+            review.LEGACY_REVIEW_PATH = card_dir / "reviews.jsonl"
+            (card_dir / "2026-09-04.jsonl").write_text(
+                '{"symbol":"AAA","setup":{"hit":true},"stamps":{}}\n', "utf-8")
+            (card_dir / "reviews.jsonl").write_text(
+                '{"as_of":"2026-09-04","symbol":"AAA","verdict":"worth"}\n', "utf-8")
+            (card_dir / "notes.jsonl").write_text("{}\n", "utf-8")
+            if store.dates() != ["2026-09-04"]:
+                return False
+            # 形状检查必须是**日期形状**，不是"含个数字就行"
+            for junk in ("backup-2026", "2026-09", "20260904", "2026-9-4"):
+                (card_dir / f"{junk}.jsonl").write_text("{}\n", "utf-8")
+            if store.dates() != ["2026-09-04"]:
+                return False
+            for junk in ("backup-2026", "2026-09", "20260904", "2026-9-4"):
+                (card_dir / f"{junk}.jsonl").unlink()
+            # **跳过了什么要说出来**，否则又是一次静默过滤
+            import logging
+            seen = []
+
+            class _Grab(logging.Handler):
+                def emit(self, rec):
+                    seen.append(rec.getMessage())
+
+            hh = _Grab()
+            store.log.addHandler(hh)
+            try:
+                store.dates()
+            finally:
+                store.log.removeHandler(hh)
+            if not any("notes" in m for m in seen):
+                return False
+            # 事件推导也不许把台账的行算进去
+            if any(e.symbol == "" for e in store.events()):
+                return False
+            note = review.migrate_if_needed()
+            if not note or "搬出" not in note:
+                return False
+            if not review.REVIEW_PATH.exists():
+                return False
+            if review.LEGACY_REVIEW_PATH.exists():
+                return False               # 双写：两份迟早对不上
+            if not (card_dir / "reviews.jsonl.moved").exists():
+                return False               # 应该改名让位，不是删除
+            if not any(r.get("symbol") == "AAA" for r in review._load()):
+                return False               # 搬丢了内容
+            return store.dates() == ["2026-09-04"]
+        finally:
+            store.CARD_DIR = old_card
+            review.REVIEW_PATH, review.LEGACY_REVIEW_PATH = old_rev, old_legacy
+
+
+def _b113_source_stays_inside_python_39():
+    """**代码不许用 3.10+ 才有的东西——因为你的 venv 是 3.9。**
+
+    build113 第一版你那边红了一条：`module.__annotations__`。
+    3.10 起模块对象自带这个属性，3.9 不带。我这边全绿、你那边报错，
+    **原因不在代码，在我用 3.11 验的"干净安装"。**
+    那不是干净安装，那是在另一台机器上安装。
+
+    所以现在有两层：这条探针扫源码里已知的 3.10+ 构造；
+    我这边打包前用真的 3.9 解释器把全套跑一遍。
+    **探针能挡住构造，挡不住语义差异——后者只有真跑才知道。**
+    """
+    import ast
+    root = Path(__file__).resolve().parents[1]
+    hits = []
+    for p in list((root / "src").rglob("*.py")) + list((root / "scripts").rglob("*.py")):
+        try:
+            tree = ast.parse(p.read_text("utf-8"))
+        except SyntaxError:
+            hits.append(f"{p.name}: 解析失败")
+            continue
+        for n in ast.walk(tree):
+            if n.__class__.__name__ == "Match":
+                hits.append(f"{p.name}:{n.lineno} match 是 3.10+")
+            if isinstance(n, ast.Attribute) and n.attr == "__annotations__":
+                hits.append(f"{p.name}:{n.lineno} 模块级 __annotations__ 在 3.9 上不存在")
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+                if n.func.id == "zip" and any(k.arg == "strict" for k in n.keywords):
+                    hits.append(f"{p.name}:{n.lineno} zip(strict=) 是 3.10+")
+                if n.func.id in ("pairwise", "anext", "aiter"):
+                    hits.append(f"{p.name}:{n.lineno} {n.func.id} 是 3.10+")
+                if n.func.id == "dataclass" and any(
+                        k.arg in ("slots", "kw_only") for k in n.keywords):
+                    hits.append(f"{p.name}:{n.lineno} dataclass(slots=) 是 3.10+")
+    if hits:
+        raise AssertionError("；".join(hits[:5]))
+    return True
+
+
+def _b113_families_carry_the_weight_not_indicators():
+    """**往一个家族里加指标，不许改变这个家族的权重。**
+
+    v2 第一版是四个平铺指标等权，其中两个来自 volume 块——量能实际拿了
+    50%，而文档写着"等权、不引入自由度"。**那是一个我没意识到自己在定的权重。**
+    再加一个量能指标就变 60%，不报错、看不出来。
+
+    这条探针从和用例不同的角度钉同一件事：**不改 FAMILIES，靠算术判别。**
+    进总分的家族成员数是不一样的（volume 2 个、accumulation 3 个），
+    所以"总分 == 各族分的等权平均"这条等式，在按成员加权的实现下必然不成立。
+    等式成立本身就证明了权重挂在族上、不挂在成员数上。
+    """
+    import math
+    import pandas as pd
+    from cio.technical import observer as tob
+    from cio.technical import score as sc
+
+    if sc.params_fingerprint() != sc.FROZEN_FINGERPRINT:
+        return False
+    if not sc.SCORE_VERSION.startswith("score-2."):
+        return False
+
+    fams = [f for f in sc.FAMILIES if f.in_score]
+    if len(fams) < 4:
+        return False
+    # 判别力的来源：族的成员数必须不全一样，否则两种加权给出同一个数
+    if len({len(f.members) for f in fams}) < 2:
+        return False
+    # 成员名不许重复（重名会互相覆盖，一个族悄悄少一个成分）
+    allm = [m for f in sc.FAMILIES for m in f.members]
+    if len({m.name for m in allm}) != len(allm):
+        return False
+
+    nrows = 300
+    cards = []
+    for k in range(6):
+        c = [100 + 0.01 * (k + 1) * i + math.sin(2 * math.pi * i / (18 + k))
+             for i in range(nrows)]
+        cards.append(tob.observe(pd.DataFrame({
+            "date": pd.bdate_range(start="2024-01-01", periods=nrows),
+            "open": c, "high": [x + 0.3 for x in c], "low": [x - 0.3 for x in c],
+            "close": c, "volume": [1e6 + 5e4 * (i % (7 + k)) for i in range(nrows)]}),
+            symbol=f"F{k}"))
+
+    # 字段名写错 = 那个成员永远缺席 = 该族权重被悄悄改了（且不报错）
+    for f in sc.FAMILIES:
+        for m in f.members:
+            blk = getattr(cards[0], m.block, None)
+            if not isinstance(blk, dict) or m.field not in blk:
+                return False
+
+    ranked = sc.rank_day(cards)
+    for r in ranked:
+        for f in sc.FAMILIES:
+            got = [r.members[m.name] for m in f.members if m.name in r.members]
+            want = round(sum(got) / len(got), 4) if got else None
+            if r.families.get(f.name) != want:
+                return False
+        fs = [r.families[f.name] for f in fams if r.families.get(f.name) is not None]
+        if not fs:
+            if r.score is not None:
+                return False
+            continue
+        # **这条等式就是"权重挂在族上"的证明**（见上面的判别力说明）
+        if r.score != round(sum(fs) / len(fs), 4):
+            return False
+        if r.band != sc.band_of(r.score):
+            return False
+
+    # 缺的成员不许补 0 / 补 0.5 —— **必须钉具体那一个成员，不能钉一个
+    # 由实现自己算出来的集合**：补值的实现会让"应该缺的"集合也变空，
+    # 等式照样成立（build112 的补 0 变异第一轮就是这样漏网的）。
+    nomono = 300
+    mono = [tob.observe(pd.DataFrame({
+        "date": pd.bdate_range(start="2024-01-01", periods=nomono),
+        "open": [100 + 0.1 * (k + 1) * i for i in range(nomono)],
+        "high": [100.5 + 0.1 * (k + 1) * i for i in range(nomono)],
+        "low": [99.5 + 0.1 * (k + 1) * i for i in range(nomono)],
+        "close": [100 + 0.1 * (k + 1) * i for i in range(nomono)],
+        "volume": [1e6] * nomono}), symbol=f"M{k}") for k in range(3)]
+    if any(c.price_structure.get("atr_to_nearest_zone_above") is not None for c in mono):
+        return False                       # 前提：单调上涨没有 swing 点、没有价区
+    for r in sc.rank_day(mono):
+        if "zone_distance" not in r.missing.get("structure", []):
+            return False
+        if "zone_distance" in r.members:
+            return False
+        # 整族算不出来时是 None，不是 0、也不是 0.5
+        if r.families.get("relative_strength") is not None:
+            return False
+
+    # **分档是标签，不是闸门。** 要钉住这条，横截面里必须真的存在
+    # "分够高、但没通过闸门"的票——否则把 band 当闸门也照样是空队列。
+    labelled = [r for r in ranked if not r.passed_gate
+                and r.band in ("WATCH", "REVIEW", "HIGH")]
+    if not labelled:
+        return False                       # 夹具没造出判别力，这条就白钉了
+    if any(r.rank is not None for r in labelled):
+        return False
+
+    # **覆盖度必须和分数一起出现，且不够时不报分。**
+    for r in ranked:
+        poss = len(fams)
+        got = [f.name for f in fams if r.families.get(f.name) is not None]
+        if r.families_possible != poss or r.families_used != len(got):
+            return False
+        if r.coverage != round(len(got) / poss, 4):
+            return False
+        if r.families_used < sc.MIN_FAMILIES:
+            # **信息不够时的正确输出是"说不出"，不是一个漂亮的高分。**
+            if r.score is not None or not r.no_score_reason or r.rank is not None:
+                return False
+        elif r.score is None:
+            return False
+    # 上市不满一年的票：252 日分位全缺 → 只剩 2 族 → **不该拿到自信的分数**
+    nshort = 40
+    short = [tob.observe(pd.DataFrame({
+        "date": pd.bdate_range(start="2024-01-01", periods=nshort),
+        "open": [100 + 0.05 * i for i in range(nshort)],
+        "high": [100.4 + 0.05 * i for i in range(nshort)],
+        "low": [99.6 + 0.05 * i for i in range(nshort)],
+        "close": [100 + 0.05 * i for i in range(nshort)],
+        "volume": [1e6 + 3e5 * (i % 5) for i in range(nshort)]}),
+        symbol=f"NEW{k}") for k in range(4)]
+    rshort = sc.rank_day(short)
+    if not rshort or any(r.families_used >= sc.MIN_FAMILIES for r in rshort):
+        return False                       # 夹具没造出低覆盖度，下面就白钉了
+    if any(r.score is not None or not r.no_score_reason or r.rank is not None
+           for r in rshort):
+        return False
+    # 一族都算不出来（取数回来是空面板）：也必须是 None，不是 0 分。
+    # **这一支在任何正常夹具下都是死代码**，所以单独造出来走一遍。
+    import copy
+    blank = copy.deepcopy(cards[0])
+    for blk in ("price_structure", "volume", "relative_strength", "volatility"):
+        setattr(blank, blk, {})
+    rblank = sc.rank_day([blank])[0]
+    if rblank.families_used != 0 or rblank.score is not None:
+        return False
+    if not rblank.no_score_reason:
+        return False
+    # **没有分数 ⟺ 说得出为什么**（同时拦住"折成 0 分"和"静默变 None"）
+    for r in list(ranked) + list(rshort) + [rblank]:
+        if (r.score is None) != bool(r.no_score_reason):
+            return False
+
+    # 覆盖度要**印在给人看的出口上**。直接构造 Ranked——不写成条件断言，
+    # 否则夹具没造出通过闸门的票时这条就白钉了。
+    synth = sc.Ranked(symbol="COV", as_of="2026-09-05", passed_gate=True,
+                      score=0.82, band="REVIEW", families={"structure": 0.8},
+                      families_used=2, families_possible=5, coverage=0.4, rank=1,
+                      within_budget=True)
+    stext = "\n".join(sc.describe(synth))
+    if "覆盖度" not in stext or "2/5" not in stext:
+        return False                       # 只存在字段、不印给人看 = 人照样横着比
+    if "族" not in sc.today_line([synth]):
+        return False
+    nos = sc.Ranked(symbol="THIN", as_of="2026-09-05", passed_gate=True,
+                    score=None, families_used=2, families_possible=5,
+                    coverage=0.4, no_score_reason="覆盖度 2/5 低于下限 3/5")
+    ntext = "\n".join(sc.describe(nos))
+    if "没有分数" not in ntext or "0.0" in ntext:
+        return False                       # 没有分数被印成了 0 分
+
+    # NR7 是单边证据，不许混进双边异常族（写死在排除名单里，连同理由）
+    if not any(b == "volatility" and f == "is_nr7"
+               for b, f, _ in sc.EXCLUDED_FROM_SCORE):
+        return False
+    for block, fld, why in sc.EXCLUDED_FROM_SCORE:
+        if len(why) < 30:
+            return False
+        for f in sc.FAMILIES:
+            if any(m.block == block and m.field == fld for m in f.members):
+                return False
+        if fld not in (getattr(cards[0], block, None) or {}):
+            return False                   # 排除的是"进分"，不是"不测量"
+
+    # 波动族是唯一一个做了判断的地方：非方向聚合，两端都靠前、中间靠后
+    # **族名必须自带 extremeness**，否则 0.9 会被读成"高波动是利好"
+    volf = next((f for f in sc.FAMILIES if f.name == "volatility_extremeness"), None)
+    if volf is None or not all(m.direction == sc.UNUSUAL for m in volf.members):
+        return False
+    if any(f.name in ("volatility_strength", "volatility_quality")
+           for f in sc.FAMILIES):
+        return False
+    un = sc._percentile_ranks([0.0, 0.25, 0.5, 0.75, 1.0], sc.UNUSUAL)
+    if un[0] != 1.0 or un[-1] != 1.0 or un[2] != 0.0:
+        return False
+    # 其余方向被定义决定：距价区越近越靠前，其它越高越靠前
+    zone = next((m for f in sc.FAMILIES for m in f.members
+                 if m.field == "atr_to_nearest_zone_above"), None)
+    if zone is None or zone.direction != sc.LOWER:
+        return False
+    if sc._percentile_ranks([0.1, 0.5, 2.0], sc.LOWER)[0] != 1.0:
+        return False
+    if sc._percentile_ranks([0.1, 0.5, 2.0], sc.HIGHER)[0] != 0.0:
+        return False
+    tie = sc._percentile_ranks([1.0, 1.0, 2.0], sc.HIGHER)
+    return tie[0] == tie[1]                # 并列必须同分位
 
 
 CHECKS = [
@@ -3128,6 +5425,38 @@ CHECKS = [
      _b109_setup_and_event_are_frozen),
     ("build110", "**事件带完整血统 / PIT 按区间判 / 复核台账**",
      _b110_lineage_pit_and_review),
+    ("build111", "**NaN 是第三种状态（算不出来 ≠ 不成立）**",
+     _b111_nan_is_the_third_state),
+    ("build112", "**v2 分流 + 回测不回流定义层**",
+     _b112_v2_score_and_backtest_discipline),
+    ("build113", "**权重挂在家族上，不挂在指标个数上**",
+     _b113_families_carry_the_weight_not_indicators),
+    ("build113", "**源码不越出 Python 3.9（你的 venv 就是 3.9）**",
+     _b113_source_stays_inside_python_39),
+    ("build114", "**全市场缺 ≠ 个别票缺（成对基准不对称）**",
+     _b114_market_wide_null_gets_a_voice),
+    ("build114", "**复核台账不是一个交易日（卡片目录不许被污染）**",
+     _b114_ledger_is_not_a_trading_day),
+    ("build114", "**基准一根 NaN 不许抹掉全市场大盘超额**",
+     _b114_one_nan_in_the_benchmark),
+    ("build115", "**改字段含义必须升 schema_version（字段名指纹）**",
+     _b115_semantics_change_moves_the_schema_version),
+    ("build117", "**窗口外发的简报不许长得像正点发的**",
+     _b117_out_of_window_brief_cannot_look_normal),
+    ("build118", "**复核台账记得住「什么时候判的」**",
+     _b118_review_records_when_the_judgement_was_made),
+    ("build119", "**心跳：今天没有 ≠ 今天没跑**",
+     _b119_heartbeat_tells_nothing_apart_from_never_ran),
+    ("build120", "**两条入口一条队列；Evidence 不拦 Technical**",
+     _b120_two_entrances_one_queue),
+    ("build121", "**调度：技术触发 force 过 INSUFFICIENT；预算数得出来**",
+     _b121_scheduler_spends_a_budget_it_can_count),
+    ("build122", "**自动化停在授权闸前面（代码保证，不是约定）**",
+     _b122_automation_stops_at_the_capital_gate),
+    ("build123", "**演习不算送到；那句话到没到你手机上**",
+     _b123_a_rehearsal_is_not_a_delivery),
+    ("build124", "**辩论换引擎：失败不返回提示词；钱是第二道闸**",
+     _b124_a_failed_call_never_becomes_an_argument),
 ]
 
 for _b, _n, _f in CHECKS:

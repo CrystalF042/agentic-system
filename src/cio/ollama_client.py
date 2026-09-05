@@ -60,7 +60,17 @@ class Ollama:
 
     # ---------------- chat ----------------
     def chat(self, prompt: str, *, system: str = "", model: Optional[str] = None,
-             temperature: float = 0.2) -> str:
+             temperature: float = 0.2, strict: bool = False) -> str:
+        """跑一次。`strict=True` 时**失败抛异常**。
+
+        默认那条降级路径（`return truncate(prompt, 240)`）是给
+        翻译 / 摘要 / 分类用的——它们外面套着 `_strip_echo`，
+        认得出这是回声并退回原文，**降级在那里是安全的**。
+
+        辩论和判定不一样：那 240 个字会变成"多头论点"，
+        **没有异常、日志一行 warning、报告照出**，然后走完闸门、
+        进论点台账、被 CRO 定仓、推到 CEO 面前。所以那两条路走 `strict`。
+        """
         model = model or settings.MODEL_LIGHT
         if self.mock:
             return "[MOCK] " + truncate(prompt.replace("\n", " "), 200)
@@ -77,7 +87,11 @@ class Ollama:
             )
             r.raise_for_status()
             return (r.json().get("message", {}) or {}).get("content", "").strip()
-        except Exception as e:  # 降级：不让一次 LLM 失败拖垮整条流水线
+        except Exception as e:
+            if strict:
+                # **绝不把提示词当成产出交出去。** 上层会把它记成 FAILED
+                # 并进心跳——今天这只票没研究成，明天重来，这是对的落点。
+                raise
             log.warning("chat 失败(%s)，降级返回原文截断", type(e).__name__)
             return truncate(prompt, 240)
 

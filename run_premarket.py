@@ -7,17 +7,30 @@
   python run_premarket.py              # 正式跑（**只在市场时区的盘前窗口内出简报**）
   python run_premarket.py --force      # 无视时间窗口，立刻跑一份
   python run_premarket.py --when       # 只打印现在算不算盘前、以及该怎么排 cron
+  python run_premarket.py --doctor     # **读机器上真正装着的排程**，对不上会指出来
   CIO_MOCK_LLM=1 CIO_TG_DRYRUN=1 python run_premarket.py --force   # 离线冒烟自测
 
 ## 时间窗口这道闸是修一个真实故障加的
 
 2026-09-02 这份简报送达时是**纽约 09-01 晚上 19:49** —— 收盘四小时之后。
 简报本身完全正确（英文抬头、ET 时间戳、美股期货、当天真实新闻），
-错的只有发车时间：cron 那行 `0 7 * * 1-5` 是**机器本地时间** 7 点，
-而这台机器在北京时区，北京 07:00 就是纽约前一天 19:00。
+**错的只有发车时间**。
 
-cron 跟不了另一个国家的夏令时，所以判断挪进 Python（见 `cio.schedule`）：
-cron 每小时敲一次门，窗口外在**发出任何网络请求之前**就退出。
+我当时把病因断成"机器在北京时区，本地 07:00 就是纽约 19:00"。
+**那个诊断是错的**：2026-09-05 实测这台机器是 `EDT`（`date` 显示
+`Fri Sep  4 22:19:54 EDT 2026`），机器本地时间就是市场时间，
+`0 7 * * 1-5` 在这台机器上本来就是美东 07:00。
+
+所以 19:49 那一班是别的原因——**而我到现在还不知道是哪一个**。
+用 `--doctor` 去读机器上真正装着的排程，不要再靠推测。
+
+不管病因是什么，这里有两道防线，**它们都不依赖我诊断对**：
+
+1. **闸门在最前面**，跑在任何网络请求之前（`cio.schedule.is_premarket`）。
+   时区判断在 Python 里算，不靠 cron ——cron 跟不了另一个国家的夏令时。
+2. **绕过闸门必须在简报上看得见。** `--force` 允许存在，但用它产出的简报
+   会在 Telegram 正文、抬头和存档文件名上都带一个窗口外标记。
+   上次那次故障的要害是：**一份 19:49 发的简报和一份 07:00 发的长得一模一样。**
 """
 from __future__ import annotations
 
@@ -59,9 +72,35 @@ def _market_stamp(b) -> str:
     return f"{b.dt_ny}" if MARKET == "us" else f"{b.dt_beijing}（北京）"
 
 
-def _summary_text(b) -> str:
-    """Telegram 正文：BLUF 先行，一屏看完要点，全文见 PDF。"""
-    lines = [f"*CIO 盘前情报简报* — {_market_stamp(b)}", ""]
+OUT_OF_WINDOW_MARK = "　⚠窗口外"
+"""窗口外产出的标记。**它出现在正文第一行、caption、和存档文件名上。**
+
+三处都要，因为这三处是简报被人看到的三条路——只标一处，
+另外两条路上的那份仍然和正点发的长得一模一样。
+"""
+
+
+def archive_base(stamp: str, out_of_window: bool = False) -> str:
+    """存档文件名。**窗口外产出的必须认得出来。**
+
+    归档里躺着的两份长得一样，三个月后没人知道哪一份是凌晨正点发的、
+    哪一份是晚上 `--force` 补跑的——而这正是上次那次故障的形状。
+    """
+    return f"CIO盘前情报简报+{stamp}" + ("+窗口外" if out_of_window else "")
+
+
+def _summary_text(b, out_of_window: bool = False) -> str:
+    """Telegram 正文：BLUF 先行，一屏看完要点，全文见 PDF。
+
+    **窗口外产出的第一行就要说清楚。** 上次故障不是发错了时间，
+    是发错时间的那份看不出来发错了时间。
+    """
+    head = f"*CIO 盘前情报简报* — {_market_stamp(b)}"
+    lines = [head + (OUT_OF_WINDOW_MARK if out_of_window else ""), ""]
+    if out_of_window:
+        ok, why = sched.is_premarket()
+        lines += [f"⚠ *这份不是在盘前窗口内产出的*：{why}",
+                  "（用 --force 绕过了时间闸。内容照常，但**发车时间不对**。）", ""]
     if b.bluf:
         lines.append("*核心要点（BLUF）*")
         for i, s in enumerate(b.bluf, 1):
@@ -80,16 +119,23 @@ def _summary_text(b) -> str:
 def main(force: bool = False) -> int:
     # **时间闸在最前面，跑在任何取数之前。**
     # 放在后面就等于"每小时采集一次全网新闻再决定要不要发"。
-    if not (force or "--force" in sys.argv
-            or os.environ.get("CIO_PREMARKET_FORCE") == "1"):
-        ok, why = sched.is_premarket()
-        if not ok:
+    forced = bool(force or "--force" in sys.argv
+                  or os.environ.get("CIO_PREMARKET_FORCE") == "1")
+    in_window, why = sched.is_premarket()
+    if not forced:
+        if not in_window:
             log.info("不在盘前窗口，本次不产出：%s", why)
             log.info("下一班：%s（市场时区）；要立刻跑一份用 --force",
                      sched.next_window_start().strftime("%Y-%m-%d %H:%M %Z"))
             print(f"跳过：{why}")
             return 0
         log.info("盘前窗口内：%s", why)
+    elif not in_window:
+        # **绕过闸门是允许的，隐瞒绕过不允许。**
+        # 上次故障的要害不是"发错了时间"，是"发错时间的那份和发对时间的
+        # 长得一模一样"。所以这里不拦，只保证它在成品上藏不住。
+        log.warning("**窗口外强制产出**：%s —— 简报会带窗口外标记", why)
+    _out_of_window = forced and not in_window
     db.init_db()
     status_u: dict = {}
     status_s: dict = {}
@@ -132,7 +178,7 @@ def main(force: bool = False) -> int:
     # 存档 md + PDF。**文件名用市场时区**：归档是按交易日排的，
     # 用机器时区命名会让纽约 09-01 傍晚那份落到 09-02 的档里。
     stamp = sched.market_now().strftime("%Y-%m-%d-%H%M")
-    base = f"CIO盘前情报简报+{stamp}"
+    base = archive_base(stamp, _out_of_window)
     md_path = TOPIC_DIR / f"{base}.md"
     pdf_path = OUT_DIR / f"{base}.pdf"
     try:
@@ -156,8 +202,10 @@ def main(force: bool = False) -> int:
 
     # 推送
     try:
-        deliver.deliver_brief(_summary_text(b), str(pdf_path) if pdf_ok else "",
-                              caption=f"CIO 盘前简报 {_market_stamp(b)}")
+        mark = OUT_OF_WINDOW_MARK if _out_of_window else ""
+        deliver.deliver_brief(_summary_text(b, _out_of_window),
+                              str(pdf_path) if pdf_ok else "",
+                              caption=f"CIO 盘前简报 {_market_stamp(b)}{mark}")
     except Exception:
         log.error("推送异常:\n%s", traceback.format_exc())
 
@@ -180,7 +228,103 @@ def main(force: bool = False) -> int:
     return 0
 
 
+def doctor() -> int:
+    """**读机器上真正装着的排程，不推测。**
+
+    2026-09-01 那份 19:49 的简报，我的病因诊断（"机器在北京时区"）
+    在 09-05 被 `date` 一条命令否掉了。同一轮里我还猜错过两次别的。
+    共同点是：**我照着一个说得通的故事往下推，而不是先取那个能一击定案的数。**
+
+    所以这里不解释，只把三件事并排印出来：
+    程序认为该几点跑、机器上装了什么、两者对不对得上。
+    """
+    import plistlib
+    import subprocess
+
+    print("=" * 60)
+    print("一、程序认为该几点跑（时区在 Python 里算，不靠 cron）")
+    ok, why = sched.is_premarket()
+    print(f"  现在{'算' if ok else '不算'}盘前：{why}")
+    print(f"  市场现在　　{sched.market_now().strftime('%Y-%m-%d %H:%M %Z')}")
+    import datetime as _dt
+    mine = _dt.datetime.now().astimezone()
+    print(f"  这台机器现在{mine.strftime('%Y-%m-%d %H:%M %Z')}（{mine.tzname()}）")
+    lo, hi = sched.window()
+    print(f"  盘前窗口（市场）{lo.strftime('%H:%M')}–{hi.strftime('%H:%M')}")
+    print("  盘前窗口（本机）{}–{}".format(*sched.local_window()))
+    print(f"  下一班　　　{sched.next_window_start().strftime('%Y-%m-%d %H:%M %Z')}")
+
+    print()
+    print("二、机器上真正装着什么")
+    found = False
+    home = Path.home()
+    for plist in sorted((home / "Library" / "LaunchAgents").glob("*cio*.plist")):
+        found = True
+        print(f"  launchd  {plist.name}")
+        try:
+            d = plistlib.loads(plist.read_bytes())
+        except Exception as e:                                 # noqa: BLE001
+            print(f"    读不动：{type(e).__name__}: {e}")
+            continue
+        args = d.get("ProgramArguments") or []
+        print(f"    命令   {' '.join(str(a) for a in args)}")
+        if any("--force" in str(a) for a in args):
+            print("    **命令里带 --force —— 时间闸被绕过，任何时刻都会发**")
+        cal = d.get("StartCalendarInterval")
+        cal = cal if isinstance(cal, list) else ([cal] if cal else [])
+        if not cal:
+            print("    **没有 StartCalendarInterval —— 它不会按时间触发**")
+        for c in cal:
+            wd = c.get("Weekday")
+            print(f"    触发   周{wd if wd is not None else '?'} "
+                  f"{c.get('Hour', '?'):0>2}:{c.get('Minute', 0):0>2}（本机时间）")
+        if any(c.get("Weekday") is None for c in cal):
+            print("    **没有 Weekday 键 —— 它每天都触发，包括周末**")
+        hours = {c.get("Hour") for c in cal if c.get("Hour") is not None}
+        wl, wh = sched.local_window()
+        want, want_hi = int(wl.split(":")[0]), int(wh.split(":")[0])
+        if hours and not any(want <= h <= want_hi for h in hours):
+            print(f"    **对不上**：本机盘前窗口是 {wl}–{wh}，而它排在 "
+                  f"{sorted(hours)} 点")
+            # **窗口外的任务不是"发错时间"，是"什么都不发"。**
+            # 时间闸修好之后它每天照常触发、照常退出，静悄悄地什么都不做——
+            # 一个不发简报的早晨和一个没跑过的早晨长得一模一样。
+            print("    **后果不是发错时间，是什么都不发**：时间闸会让它当场退出。")
+            logf = Path(__file__).resolve().parent / "logs" / "premarket.out.log"
+            if logf.exists():
+                try:
+                    txt = logf.read_text("utf-8", errors="replace")
+                    n_skip = txt.count("跳过")
+                    print(f"    日志里已经有 {n_skip} 次「跳过」"
+                          f"（{logf}）")
+                except Exception:                              # noqa: BLE001
+                    pass
+            print("    修： bash scripts/install_launchd.sh   （小时数从窗口现算）")
+    try:
+        cr = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=10)
+        lines = [x for x in (cr.stdout or "").splitlines()
+                 if "premarket" in x or "cio" in x.lower()]
+        for x in lines:
+            found = True
+            print(f"  cron     {x.strip()}")
+            if "--force" in x:
+                print("    **这行带 --force —— 时间闸被绕过**")
+    except Exception:                                          # noqa: BLE001
+        pass
+    if not found:
+        print("  **没找到任何 cio 相关的 launchd / cron 条目。**")
+        print("  也就是说：现在没有任何东西会自动发盘前简报。")
+        print("  装一个： bash scripts/install_launchd.sh")
+
+    print()
+    print("三、建议")
+    print("\n".join("  " + x for x in sched.cron_hint()))
+    return 0
+
+
 if __name__ == "__main__":
+    if "--doctor" in sys.argv:
+        raise SystemExit(doctor())
     if "--when" in sys.argv:
         # **只回答"什么时候该跑"，一个网络请求都不发。**
         ok, why = sched.is_premarket()

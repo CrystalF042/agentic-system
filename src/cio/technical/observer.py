@@ -38,12 +38,14 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from typing import Optional
 
 from . import SCHEMA_VERSION
 from . import price_structure, relative_strength, volatility, volume
+from .numbers import panel_health, scrub
 
 MIN_ROWS = 2
 """低于这个行数连"最新收盘价"都谈不上，直接给一张空卡片（**不是抛异常**）：
@@ -72,6 +74,11 @@ class SignalCard:
     volume: dict = field(default_factory=dict)
     relative_strength: dict = field(default_factory=dict)
     volatility: dict = field(default_factory=dict)
+    panel_health: dict = field(default_factory=dict)
+    """面板体检：缺失行、零成交量、负价、上下影错位各有几根。
+
+    **不修数据，只如实数。** 补一根插值出来的 K 线会让所有度量都算得出来、
+    而且看不出是补的——那比留一个 null 糟得多。"""
     reasons: dict = field(default_factory=dict)
     """**每一个 null 字段在这里都必须有一条。** 见 `_check_nulls`。"""
 
@@ -83,11 +90,43 @@ class SignalCard:
             "schema_version": self.schema_version, "algo_version": self.algo_version,
             "price_structure": self.price_structure, "volume": self.volume,
             "relative_strength": self.relative_strength, "volatility": self.volatility,
-            "reasons": self.reasons,
+            "panel_health": self.panel_health, "reasons": self.reasons,
         }
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True)
+
+
+def card_fields_fingerprint(card: SignalCard) -> str:
+    """卡片全部字段名（含四个块内部的字段）的指纹。**只看名字，不看值。**
+
+    语义变了没法自动检测——`rs_mkt_samples` 从"对齐了几天"改成"几天能用"，
+    字段名一个字母都没动，而同一份输入会给出不同的数（build114 就是这样，
+    **我当时没升 `SCHEMA_VERSION`**）。
+
+    但**字段集变了可以检测**。所以这条指纹钉住的是那一半：
+    加或删任何一个字段都会红。红了不是让你改常量，是让你回答一句——
+    **这次改动要不要升 `SCHEMA_VERSION`？**
+    """
+    d = card.to_dict()
+    names = []
+    for k in sorted(d):
+        if k == "reasons":
+            # **`reasons` 的键是随卡片变的**（哪个字段算不出来就记哪个），
+            # 它是诊断侧信道，不是字段契约的一部分。放进指纹会让同一版代码
+            # 在不同的票上给出不同的指纹——那样这条探针每天都红，也就等于没有。
+            names.append(k)
+            continue
+        v = d[k]
+        if isinstance(v, dict):
+            names += [f"{k}.{kk}" for kk in sorted(v)]
+        else:
+            names.append(k)
+    return hashlib.sha256("|".join(names).encode()).hexdigest()[:16]
+
+
+FROZEN_FIELDS_FINGERPRINT = "518ee3b0f5107cb2"
+"""它红了，先回答：**这次是加字段（可以不升版本），还是改语义（必须升）？**"""
 
 
 def _nulls(block: dict) -> list:
@@ -162,6 +201,18 @@ def observe(df, as_of: Optional[str] = None, bench=None, sector_bench=None,
     ):
         setattr(card, name, vals)
         card.reasons.update(why)
+
+    # **面板进门体检。** NaN 不会报错，但它会静默地把度量变成 NaN、
+    # 把 setup 条件判成 False，而 `unknown` 里什么都不写——2026-09-02
+    # 全市场 502 只那一跑就是这么坏的。见 `numbers.py`。
+    card.panel_health, problems = panel_health(sub)
+    if problems:
+        card.reasons["panel_health"] = "；".join(problems)
+
+    # 兜底再洗一遍：各 measure 已经各自 scrub 过，这一道是为了
+    # **以后有人加新度量时不会漏**——漏了不报错，正是要防的。
+    for name in ("price_structure", "volume", "relative_strength", "volatility"):
+        scrub(getattr(card, name), card.reasons)
 
     card.algo_version = card.price_structure.get("algo_version", price_structure.ALGO_VERSION)
     bad = _check_nulls(card)

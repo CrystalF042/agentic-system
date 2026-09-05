@@ -51,6 +51,10 @@ CREATE INDEX IF NOT EXISTS ix_thesis_status ON unit_a_thesis(status, symbol);
 _ADD_COLUMNS = [
     ("material_verdict", "TEXT DEFAULT ''"),
     ("material_substantive", "INTEGER DEFAULT 0"),
+    # build124：辩论可以跑在本地，也可以跑在 Claude。**台账必须记是谁写的。**
+    # 不记的话，半年后这张表里一半论点出自另一个模型而没人知道是哪一半，
+    # 于是「换 Claude 收益最大」永远停在判断，变不成事实。
+    ("engine", "TEXT DEFAULT ''"),
 ]
 
 # 复检时的停用词：这些词在任何一条新闻里都可能出现，
@@ -83,7 +87,7 @@ def init() -> None:
 def record(*, as_of_date: str, subject: str, symbol: str, direction: str,
            conviction: str, thesis: str, catalysts: list, invalidations: list,
            panel: dict, unverified: int = 0, material_verdict: str = "",
-           material_substantive: int = 0) -> int:
+           material_substantive: int = 0, engine: str = "") -> int:
     """登记今日观点。
 
     **没有失效条件的论点不进 OPEN。** 它按定义永远不可能被复检命中
@@ -128,14 +132,14 @@ def record(*, as_of_date: str, subject: str, symbol: str, direction: str,
         cur = con.execute(
             "INSERT INTO unit_a_thesis(created_at,as_of_date,subject,symbol,direction,conviction,"
             "thesis,catalysts,invalidations,panel,unverified,status,"
-            "material_verdict,material_substantive) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "material_verdict,material_substantive,engine) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (stamp_utc(), as_of_date, subject, symbol or "", direction, conviction,
              thesis[:8000], json.dumps(catalysts, ensure_ascii=False),
              json.dumps(invalidations, ensure_ascii=False),
              json.dumps(panel, ensure_ascii=False)[:20000], int(unverified),
              "OPEN" if invalidations else "NO_CONDITIONS",
-             material_verdict, int(material_substantive)))
+             material_verdict, int(material_substantive), engine or ""))
         tid = cur.lastrowid
     log.info("一部论点已登记 #%d %s %s|%s，失效条件 %d 条（状态 %s），材料判定 %s（实质 %d 条）",
              tid, subject, direction, conviction, len(invalidations),

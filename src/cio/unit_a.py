@@ -972,8 +972,14 @@ def build_unit_a(text: str, force: bool = False) -> UnitAAdvice:
 
     # 3) 对抗式辩论：Round1 独立建案（互不可见防锚定）→ Round2 交换反驳并直面不利证据
     #    → Judge 只做论证审计 → Synthesizer 出一部观点（到"方向+论证"为止，不给仓位）
-    oll = get_ollama()
-    mdl = settings.MODEL_BRIEF
+    # **辩论跑在哪个引擎上，只有 `llm.engine()` 这一处决定。**
+    # 不设 CIO_DEBATE_ENGINE 就还是本地 gpt-oss —— 换引擎必须是一次明确的动作。
+    # 失败**抛异常**：调度器会把它记成 FAILED 并进心跳，
+    # 而不是把提示词的回声当成"多头论点"交出去。
+    from . import llm as _llm
+    oll = _llm.engine()
+    mdl = oll.model
+    stage("engine", _llm.describe_spec(oll.spec))
     nmat = len(materials)
     # 被闸门判为「无实质」的材料编号。引用它们不算错，但要在报告里看得见——
     # 否则一条建立在"财报倒计时"标题上的论据，读起来和一条建立在 8-K 上的一样。
@@ -1041,7 +1047,8 @@ def build_unit_a(text: str, force: bool = False) -> UnitAAdvice:
             symbol=info.get("symbol") or "", direction=direction, conviction=conviction,
             thesis=synthesis, catalysts=d["catalysts"], invalidations=d["invalidations"],
             panel=evidence.panel_dict(panel), unverified=unverified,
-            material_verdict=gate["verdict"], material_substantive=gate["n_sub"])
+            material_verdict=gate["verdict"], material_substantive=gate["n_sub"],
+            engine=oll.spec)
     except Exception as e:
         log.warning("论点台账写入/复检失败（不影响本次观点产出）：%s", e)
 
@@ -1063,6 +1070,10 @@ def build_unit_a(text: str, force: bool = False) -> UnitAAdvice:
         material_verdict=gate["verdict"], material_substantive=gate["n_sub"],
         material_banner=gate["banner"], material_labels=material_gate.render_labels(materials, gate),
         thesis_id=tid, invalidation_hits=hits, llm_calls=d["llm_calls"],
+        # **两个引擎并存之后，"这条论点是谁写的"必须答得出来。**
+        # 半年后台账里一条「看多|中」，说不出是 gpt-oss 还是 Claude 写的，
+        # 那这两个引擎就永远比不出高下。
+        engine=oll.spec, engine_remote=oll.remote, usage=oll.usage.to_dict(),
         quant=quant,
         sources=sources[:8], materials=materials, unverified_count=unverified,
         material_count=len(materials), status=status,

@@ -721,11 +721,48 @@ def get_benchmark(days: int = 500, status: dict | None = None):
         return pd.DataFrame({"date": dates, "close": close})
     # us：基准用 SPY adjusted（免费 total-return 代理，与个股 adjusted 同口径）
     if MARKET == "us":
-        df = _yf_hist(market().get("bench_source", "SPY"), days)
+        sym = market().get("bench_source", "SPY")
+        df = _yf_hist(sym, days)
         if df is not None and len(df):
-            status["benchmark"] = f"yfinance:{market().get('bench_source', 'SPY')}(adjusted)"
+            # **"取到了"和"取全了"是两回事。** 一个 30 行的 SPY 面板照样
+            # 通过 `len(df)`，然后让全市场每一只票的大盘超额同时变成 null——
+            # 不报错、日志正常，只在 502 张卡片的"缺："行里各留一句话。
+            status["benchmark"] = f"yfinance:{sym}(adjusted)"
+            status["benchmark_rows"] = int(len(df))
+            status["benchmark_want"] = int(days)
+            status["benchmark_span"] = (str(df["date"].iloc[0])[:10],
+                                        str(df["date"].iloc[-1])[:10])
+            if len(df) < days * 0.5:
+                status["benchmark_short"] = (
+                    f"**基准只取到 {len(df)} 行（要 {days} 行）** —— "
+                    f"这会让全市场每一只票的大盘超额同时变 null，"
+                    f"不是个别票缺数据")
+            # **行数够不等于能用。** 2026-09-04 真实发生过：SPY 405 行、
+            # 只有最后一根收盘是 NaN（yfinance 尾行），于是全市场 502 只票的
+            # excess_mkt_21/63/126 同时变 null——因为三个窗口共用 `series[-1]`。
+            # 行数检查完全看不见这件事，所以这里单独数 NaN，**并且单独看最后一根**。
+            bad = int(df["close"].isna().sum())
+            status["benchmark_nan"] = bad
+            last_bad = bool(len(df) and df["close"].isna().iloc[-1])
+            status["benchmark_last_bad"] = last_bad
+            # **说现在是什么，不要说修复之前会怎样。**
+            # 第一版这里写的是"会让全市场的大盘超额同时变 null"——那是
+            # `align()` 修好之前的后果。而 yfinance 那根未落定的尾行**每天都有**，
+            # 于是这盏灯天天亮，报一个不会发生的故障。
+            # **常亮的灯和不亮的灯是同一种缺陷。**
+            if last_bad:
+                status["benchmark_last_note"] = (
+                    "基准最后一根收盘是 NaN（yfinance 未落定的尾行，常见）—— "
+                    "**已按不可用样本丢掉**，超额照算；代价是这一路的超额"
+                    "截止到上一个交易日，比板块那一路晚一天（卡片上的 "
+                    "rs_mkt_as_of / rs_sector_as_of 会显示出来）")
+            elif bad:
+                status["benchmark_last_note"] = (
+                    f"基准中间有 {bad} 根收盘是 NaN（最后一根正常）—— "
+                    f"已按不可用样本丢掉，截止日不受影响")
             return df[["date", "close"]]
         status["benchmark"] = "缺"
+        status["benchmark_rows"] = 0
         return None
     # akshare 指数
     try:

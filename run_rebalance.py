@@ -37,7 +37,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
-from cio import book, compliance, marks, pc_ledger              # noqa: E402
+from cio import book, compliance, marks, propose                # noqa: E402
 from cio import portfolio, proposal_store, rebalance, runid     # noqa: E402
 from cio.config import market, market_date                      # noqa: E402
 from cio.utils import get_logger, stage                         # noqa: E402
@@ -117,103 +117,58 @@ def main() -> int:                                              # noqa: C901
 
     as_of = str(market_date())
 
-    # ---------------------------------------------------------- 账本必须先开
-    if not book.is_book_portfolio(pid):
-        msg = (f"{pid} 还没开账。先跑一次：\n"
-               f"    CIO_MARKET=us python run_rebalance.py --open-book "
-               f"--capital 100000 --opened-on {as_of}\n"
-               f"**开账日和初始资金是写进去的事实，不从最早一笔交易倒推。**")
-        say(msg)
+    # ---------------------------------------------------------- 提案
+    # **这一整段只有一份实现**（`cio.propose.for_run`）：build122 起
+    # 自动流水线也要产生提案，在那边再写一遍「取决策 → 取价 → 算 NAV →
+    # 算股数 → 跑合规 → 落库」就是六步等价代码，而两处等价的代码
+    # 迟早变成"一个测得到、一个测不到"。
+    payload = None
+
+    def _serialize_before_record(o):
+        """**先序列化，后落库。** 这个回调在一条都还没写库时被调用：
+        序列化会炸就在这里炸，整次运行干净地失败，重试是安全的。"""
+        nonlocal payload
         if as_json:
-            return _emit(runid.envelope("rebalance", RUN_ID, status="book_not_open",
-                                        portfolio_id=pid, as_of=as_of, note=msg,
-                                        rows=[], summary={}))
-        return 0
-    book.assert_single_source(pid)
+            payload = runid.envelope(
+                "rebalance", RUN_ID, status="completed",
+                as_of=as_of, portfolio_id=pid, pc_run_id=o["run_id"],
+                book=book.portfolio_row(pid), nav=o["nav"],
+                price_basis=marks.PRICE_BASIS, prices=o["price_detail"],
+                compliance=o["compliance"], summary=o["summary"], rows=o["rows"],
+                expired=[{"id": e["id"], "ticker": e["ticker"]} for e in o["expired"]],
+                note="Build 1：只提案不成交。执行在 Build 2（T+1 开盘）。")
 
-    # ---------------------------------------------------------- 先作废过期提案
-    # **必须在提案之前。** 否则昨天那批 PENDING 会一直挂着，
-    # 某天被批准并按当日开盘成交 —— 用的却是好几天前算出的股数。
-    expired = proposal_store.expire_stale(pid, as_of, actor=RUN_ID)
-    if expired:
-        say(f"⚠ {len(expired)} 条旧提案已过期作废（股数基于更早的 NAV 与价格，"
-            f"不能拿来今天成交）：" + "、".join(e["ticker"] for e in expired))
+    res = propose.for_run(portfolio_id=pid, as_of=as_of,
+                          run_id=_arg(argv, "--run-id"), actor=RUN_ID,
+                          before_record=_serialize_before_record)
 
-    # ---------------------------------------------------------- 取那一次决策
-    run_id = _arg(argv, "--run-id") or pc_ledger.latest_run_id(pid)
-    if not run_id:
-        msg = (f"{pid} 在 pc_lineage 里没有任何一次 PC 运行 —— 先跑 run_pc.py。"
-               f"**这不是「今天没有候选」**：那种情况下 PC 会留下一次运行记录，"
-               f"只是每一行都没有仓位。")
-        say(msg)
+    if res["status"] != propose.COMPLETED:
+        say(res["note"])
         if as_json:
-            return _emit(runid.envelope("rebalance", RUN_ID, status="no_pc_run",
-                                        portfolio_id=pid, as_of=as_of, note=msg,
-                                        rows=[], summary={}))
+            return _emit(runid.envelope("rebalance", RUN_ID, status=res["status"],
+                                        portfolio_id=pid, as_of=as_of,
+                                        note=res["note"], rows=[], summary={}))
         return 0
-    decisions = pc_ledger.decisions_for_run(run_id, pid)
-    stage("decisions", f"run={run_id} rows={len(decisions)}")
 
-    held = book.holdings_map(pid)
+    run_id, saved, expires = res["run_id"], res["saved"], res["expires"]
+    cmp_res, held = res["compliance"], res["held"]
+    if res["expired"]:
+        say(f"⚠ {len(res['expired'])} 条旧提案已过期作废（股数基于更早的 NAV 与价格，"
+            f"不能拿来今天成交）：" + "、".join(e["ticker"] for e in res["expired"]))
+    stage("decisions", f"run={run_id} rows={len(res['decisions'])}")
+
     say("=" * 72)
     say(f"调仓提案　portfolio={pid}　as-of {as_of}")
-    say(f"依据 PC 运行 {run_id}（{len(decisions)} 条决策，含被否决与无仓位的）")
+    say(f"依据 PC 运行 {run_id}（{len(res['decisions'])} 条决策，含被否决与无仓位的）")
     say(f"现有持仓 {len(held)} 笔" + ("：" + "、".join(sorted(held)) if held else "（无）"))
     say("=" * 72)
-
-    # ---------------------------------------------------------- 价格与 NAV
-    tickers = sorted({d["ticker"] for d in decisions if d.get("ticker")} | set(held))
-    px_detail = marks.close_prices(tickers)
-    prices = {t: d["price"] for t, d in px_detail.items() if d.get("price") is not None}
-    say("\n" + marks.render_note(px_detail))
-
-    nv = book.nav(pid, prices)
-    say("\n" + book.render(pid, prices))
-
-    # ---------------------------------------------------------- 目标 → 指令
-    pl = rebalance.plan(nav=nv["nav"], cash=nv["cash"], holdings=held,
-                        decisions=decisions, prices=prices, decision_date=as_of,
-                        lot=int(book.portfolio_row(pid).get("lot_size") or 1))
+    say("\n" + res["renders"]["prices"])
+    say("\n" + res["renders"]["book"])
     say("\n" + "-" * 72)
-    say(rebalance.render(pl))
-
-    # ---------------------------------------------------------- 事前合规
-    cmp_res = compliance.check_proforma(
-        nav=nv["nav"], cash_available=nv["cash"],
-        cash_required=pl["summary"]["cash_required"], rows=pl["rows"])
+    say(res["renders"]["plan"])
     say("\n" + "-" * 72)
-    say(compliance.render(cmp_res))
-
-    # **先序列化，后落库。** 与 run_pc 同一条纪律：反过来的话，
-    # 提案已经写进库 → 序列化炸了 → 界面判定失败 → 用户重试 → 库里两条。
-    payload = None
-    if as_json:
-        payload = runid.envelope(
-            "rebalance", RUN_ID, status="completed",
-            as_of=as_of, portfolio_id=pid, pc_run_id=run_id,
-            book=book.portfolio_row(pid), nav=nv,
-            price_basis=marks.PRICE_BASIS, prices=px_detail,
-            compliance=cmp_res, summary=pl["summary"], rows=pl["rows"],
-            expired=[{"id": e["id"], "ticker": e["ticker"]} for e in expired],
-            note="Build 1：只提案不成交。执行在 Build 2（T+1 开盘）。")
-
-    # ---------------------------------------------------------- 落库
-    # **每一行都落，包括不带指令的。** 只记要交易的两只，
-    # 报告上就看不出另外八只发生了什么 —— 而"持有但今天没人复审"
-    # 和"根本没纳入评估"都必须能被分辨。
-    expires = pl["summary"]["expires_on"]
-    saved = []
-    for r in pl["rows"]:
-        saved.append(proposal_store.record(
-            run_id=run_id, portfolio_id=pid, row=r, nav=nv["nav"],
-            decision_date=as_of, expires=expires, compliance=cmp_res,
-            actor=RUN_ID))
-
-    # 本轮真正做出过判断的持仓 → 刷新复审日期。
-    evaluated = [r["ticker"] for r in pl["rows"] if r["basis"] != rebalance.NO_TARGET]
-    n_marked = book.mark_evaluated(pid, [t for t in evaluated if t in held],
-                                   as_of, run_id)
-    stage("proposed", f"rows={len(saved)} marked_evaluated={n_marked}")
+    say(res["renders"]["compliance"])
+    stage("proposed", f"rows={len(saved)} marked_evaluated={res['n_marked']}")
 
     # ---------------------------------------------------------- 推到手机
     # **按钮要有人接才有用。** 控制台（run_tgbot.py）没在跑的时候，

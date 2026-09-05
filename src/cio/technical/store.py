@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from ..config import RAW_DIR
@@ -69,10 +70,34 @@ def write_day(as_of: str, cards: list, force: bool = False) -> tuple[int, str]:
     return n, note
 
 
+_DATE_STEM = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
 def dates() -> list:
+    """已存的交易日。**只认 `YYYY-MM-DD` 形状的文件名。**
+
+    原来这里是 `glob("*.jsonl")` 直接取 stem，而人工复核台账
+    `reviews.jsonl` 就存在同一个目录里——于是 `reviews` 被当成了一个交易日。
+    `events()` / `version_drift()` / `hit_series()` 全都在遍历 `dates()`，
+    也就是说**台账的行一直在被当作信号卡片读**。
+
+    今天没出事，只因为台账的行里没有 `symbol`、恰好被跳过。
+    **"恰好没出事"和"不会出事"是两回事。**
+
+    台账已经搬出这个目录了（见 `review.REVIEW_PATH`）。这里再加一道形状检查，
+    是因为**"目录里只该有卡片"是一个约定，而约定会被下一个人打破**——
+    日志、备份、`.DS_Store`、临时导出，都可能落进来。
+    """
     if not CARD_DIR.exists():
         return []
-    return sorted(p.stem for p in CARD_DIR.glob("*.jsonl"))
+    out, skipped = [], []
+    for p in sorted(CARD_DIR.glob("*.jsonl")):
+        (out if _DATE_STEM.match(p.stem) else skipped).append(p.stem)
+    if skipped:
+        # **跳过了什么必须说出来**，否则又变成一次静默过滤
+        log.warning("卡片目录里有 %d 个不是日期的文件，已跳过：%s",
+                    len(skipped), "、".join(skipped[:5]))
+    return out
 
 
 def load_day(as_of: str) -> list:

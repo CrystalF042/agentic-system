@@ -61,6 +61,14 @@ CONDITIONS = [
 
 
 def _q(vals: list, p: float):
+    """分位数。**先剔 NaN 再排序。**
+
+    `sorted()` 遇到 NaN 会静默给出乱序（NaN 和任何数比较都是 False，
+    排序的不变量直接失效），结果就是分位数不再单调递增——
+    2026-09-02 那张表里 `cmf_20` 的 p10 大于 p25 就是这么来的。
+    """
+    import math
+    vals = [v for v in vals if not (isinstance(v, float) and not math.isfinite(v))]
     if not vals:
         return None
     s = sorted(vals)
@@ -151,7 +159,8 @@ def main() -> int:
     print("-" * 94)
     for block, key in FIELDS:
         vals = [getattr(c, block).get(key) for c in cards]
-        good = [v for v in vals if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        good = [v for v in vals if isinstance(v, (int, float)) and not isinstance(v, bool)
+                and __import__("math").isfinite(v)]
         cover = f"{len(good)}/{len(cards)}"
         print(f"{block + '.' + key:<38}{cover:>6}"
               + "".join(f"{_fmt(_q(good, p)):>10}"

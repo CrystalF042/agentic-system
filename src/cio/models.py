@@ -286,7 +286,15 @@ class UnitAAdvice(BaseModel):
     run_id: str = ""                 # 本次运行的身份。**界面按它取结果，不按"最近一次"**
     thesis_id: int = 0               # 论点台账 ID（供后续失效复检回指）
     invalidation_hits: list = Field(default_factory=list)   # 本轮命中的历史失效条件
-    llm_calls: int = 0               # 本次辩论实际调用本地模型的次数（成本可见）
+    llm_calls: int = 0               # 本次辩论实际调用了几次模型（成本可见）
+    # ---- 引擎血统（build124）----
+    # 辩论可以跑在本地 gpt-oss，也可以跑在 Claude。**产出上必须记是谁写的**：
+    # 两个引擎并存之后，半年后台账里一条「看多|中」说不出出处，
+    # 那这两个引擎就永远比不出高下 —— 而"换 Claude 收益最大"会一直停在判断，
+    # 变不成事实。
+    engine: str = ""                 # 例：ollama:gpt-oss:20b / claude:claude-sonnet-5
+    engine_remote: bool = False      # 这一轮的材料有没有离开本机
+    usage: dict = Field(default_factory=dict)   # token 是事实，usd 是按带日期的价目表估的
     quant: list[str] = Field(default_factory=list)   # 回测/行情支撑（yfinance 真值）
     materials: list[MaterialItem] = Field(default_factory=list)  # 采集材料清单（论据引用依据）
     unverified_count: int = 0       # 被标「⚠未核实」的论据条数

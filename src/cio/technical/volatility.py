@@ -21,6 +21,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+from .numbers import scrub
+
 ATR_N = 14
 """ATR 的标准窗口。"""
 
@@ -178,4 +180,4 @@ def measure(df) -> tuple[dict, dict]:
     vals[f"is_nr{NR_N}"] = nr
     if nr is None:
         why[f"is_nr{NR_N}"] = f"需要至少 {NR_N} 根 K 线，只有 {n} 根"
-    return vals, why
+    return scrub(vals, why)

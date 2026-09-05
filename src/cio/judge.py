@@ -453,7 +453,9 @@ def ollama_chat(model: str, temperature: float = 0.0) -> Callable[[str], str]:
     oll = get_ollama()
 
     def _chat(prompt: str) -> str:
-        return oll.chat(prompt, model=model, temperature=temperature)
+        # **strict**：判定器拿到提示词的回声会把它解析成一个档位，
+        # 而那个档位读起来和真判定一模一样。
+        return oll.chat(prompt, model=model, temperature=temperature, strict=True)
     return _chat
 
 

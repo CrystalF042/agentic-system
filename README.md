@@ -70,7 +70,7 @@ boundaries and assigns each role to a component with a fixed contract:
   compute_scores        RS vs SPY / sector ETF               │
   validation            ATR percentile · NR7                 ▼
   HAC + Holm + BH             │                        Evidence Gate
-         │                    ▼                        (shipped · 135 probes)
+         │                    ▼                        (shipped · 137 probes)
          │            ┌───────────────┐                      │
          │            │  Signal Card  │                      │
          │            │  v1: describe │                      │
@@ -413,7 +413,7 @@ cp .env.example .env
 .venv/bin/python scripts/check_build.py
 ```
 
-`check_build.py` runs 135 probes and must be green before anything else. It is the
+`check_build.py` runs 137 probes and must be green before anything else. It is the
 accumulated record of defects that did not raise an error — each probe exists
 because something once failed silently.
 
@@ -487,9 +487,9 @@ milliseconds outside its window, so daylight-saving changes need no attention.
 ## Testing
 
 ```bash
-.venv/bin/python scripts/check_build.py     135 install probes
+.venv/bin/python scripts/check_build.py     137 install probes
 .venv/bin/python scripts/test_intake.py     57  collection and gate
-.venv/bin/python scripts/test_technical.py  34  Technical Observer
+.venv/bin/python scripts/test_technical.py  45  Technical Observer
 .venv/bin/python scripts/test_judge.py      21  judge guardrails
 .venv/bin/python scripts/test_book.py       23  portfolio and ledger
 ```
@@ -514,18 +514,35 @@ too weak to exercise it — both have happened here, and both were found this wa
 
 | Component | State |
 |---|---|
-| CIO collection + Evidence Gate | Shipped · 135 probes |
+| CIO collection + Evidence Gate | Shipped · 137 probes |
 | Unit B factor measurement | Shipped |
 | Unit A adversarial research | Shipped |
 | CRO / PC / Execution / Ledger | Shipped (paper only) |
 | Technical Observer v1 | **Shipped — describe only** |
-| Technical Gate v2 (scoring) | Not started — waiting on forward-collected data |
+| Technical Gate v2 (triage) | **Shipped** — absolute gate decides *whether*, cross-sectional rank decides *who first* |
+| Event study | **Shipped** — one-shot, survivorship bias measured and stated |
 | Research Router — technical trigger | Not connected by design |
 
-The Technical Observer is deliberately inert. Its setup definition is frozen with a
-parameter fingerprint bound to a version string, and the thresholds were chosen from
-whole-market base rates **before any forward return was examined**. Scoring comes
-after enough forward-collected observations exist to test it — not before.
+The Technical Observer is deliberately inert — it never triggers research. Its setup
+definition is frozen with a parameter fingerprint bound to a version string, and the
+thresholds were chosen from whole-market base rates **before any forward return was
+examined**.
+
+v2 adds triage, not a better threshold. Whole-market base rates showed the same fixed
+rule surfacing 14 names on one day and 109 on another — that is the market's volatility
+moving, not signal strength, and a human's attention budget is fixed. So the frozen
+absolute gate decides *whether there is anything today* (it must be able to say no),
+and a cross-sectional percentile rank decides *who to look at first*. The rank is
+equal-weighted across four components — not because equal weighting is optimal, but
+because weighting them any other way would be a fitted parameter with nothing
+legitimate to fit it on.
+
+The event study runs once and reports whatever it finds. It is **not** an out-of-sample
+test: the constituent list is today's, the thresholds came from the same period's
+cross-section, and events cluster by day with overlapping indicator windows. Its value
+is falsification — if nothing shows up under conditions this favourable to itself, that
+is worth knowing. A probe enforces that `score.py` and `setups.py` cannot import the
+backtest module, so results can never quietly feed back into the definition.
 
 Historical replay is refused while `universe_pit` is false: the constituent list is
 today's, so replaying a year of it would only study the names that survived.

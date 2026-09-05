@@ -35,6 +35,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+from .numbers import scrub
+
 RVOL_N = 20
 OBV_SLOPE_N = 20
 CMF_N = 20
@@ -204,4 +206,4 @@ def measure(df) -> tuple[dict, dict]:
         "note": "日线 OHLCV 看不见持仓与单子归属；这四个数只说明"
                 "上涨日与下跌日的成交量对比，不构成任何关于谁在交易的推断",
     }
-    return vals, why
+    return scrub(vals, why)
